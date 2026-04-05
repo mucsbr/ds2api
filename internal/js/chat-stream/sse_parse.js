@@ -6,15 +6,78 @@ const {
 } = require('../shared/deepseek-constants');
 
 function parseChunkForContent(chunk, thinkingEnabled, currentType, stripReferenceMarkers = true) {
-  if (!chunk || typeof chunk !== 'object' || !Object.prototype.hasOwnProperty.call(chunk, 'v')) {
-    return { parts: [], finished: false, newType: currentType };
+  if (!chunk || typeof chunk !== 'object') {
+    return {
+      parsed: false,
+      parts: [],
+      finished: false,
+      contentFilter: false,
+      errorMessage: '',
+      outputTokens: 0,
+      newType: currentType,
+    };
   }
+
+  if (Object.prototype.hasOwnProperty.call(chunk, 'error')) {
+    return {
+      parsed: true,
+      parts: [],
+      finished: true,
+      contentFilter: false,
+      errorMessage: formatErrorMessage(chunk.error),
+      outputTokens: 0,
+      newType: currentType,
+    };
+  }
+
   const pathValue = asString(chunk.p);
+  const outputTokens = extractAccumulatedTokenUsage(chunk);
+
+  if (hasContentFilterStatus(chunk)) {
+    return {
+      parsed: true,
+      parts: [],
+      finished: true,
+      contentFilter: true,
+      errorMessage: '',
+      outputTokens,
+      newType: currentType,
+    };
+  }
+
   if (shouldSkipPath(pathValue)) {
-    return { parts: [], finished: false, newType: currentType };
+    return {
+      parsed: true,
+      parts: [],
+      finished: false,
+      contentFilter: false,
+      errorMessage: '',
+      outputTokens,
+      newType: currentType,
+    };
   }
   if (pathValue === 'response/status' && asString(chunk.v) === 'FINISHED') {
-    return { parts: [], finished: true, newType: currentType };
+    return {
+      parsed: true,
+      parts: [],
+      finished: true,
+      contentFilter: false,
+      errorMessage: '',
+      outputTokens,
+      newType: currentType,
+    };
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(chunk, 'v')) {
+    return {
+      parsed: true,
+      parts: [],
+      finished: false,
+      contentFilter: false,
+      errorMessage: '',
+      outputTokens,
+      newType: currentType,
+    };
   }
 
   let newType = currentType;
@@ -74,22 +137,54 @@ function parseChunkForContent(chunk, thinkingEnabled, currentType, stripReferenc
   const val = chunk.v;
   if (typeof val === 'string') {
     if (val === 'FINISHED' && (!pathValue || pathValue === 'status')) {
-      return { parts: [], finished: true, newType };
+      return {
+        parsed: true,
+        parts: [],
+        finished: true,
+        contentFilter: false,
+        errorMessage: '',
+        outputTokens,
+        newType,
+      };
     }
     const content = asContentString(val, stripReferenceMarkers);
     if (content) {
       parts.push({ text: content, type: partType });
     }
-    return { parts, finished: false, newType };
+    return {
+      parsed: true,
+      parts: filterLeakedContentFilterParts(parts),
+      finished: false,
+      contentFilter: false,
+      errorMessage: '',
+      outputTokens,
+      newType,
+    };
   }
 
   if (Array.isArray(val)) {
     const extracted = extractContentRecursive(val, partType, stripReferenceMarkers);
     if (extracted.finished) {
-      return { parts: [], finished: true, newType };
+      return {
+        parsed: true,
+        parts: [],
+        finished: true,
+        contentFilter: false,
+        errorMessage: '',
+        outputTokens,
+        newType,
+      };
     }
     parts.push(...extracted.parts);
-    return { parts, finished: false, newType };
+    return {
+      parsed: true,
+      parts: filterLeakedContentFilterParts(parts),
+      finished: false,
+      contentFilter: false,
+      errorMessage: '',
+      outputTokens,
+      newType,
+    };
   }
 
   if (val && typeof val === 'object') {
@@ -116,7 +211,15 @@ function parseChunkForContent(chunk, thinkingEnabled, currentType, stripReferenc
       }
     }
   }
-  return { parts, finished: false, newType };
+  return {
+    parsed: true,
+    parts: filterLeakedContentFilterParts(parts),
+    finished: false,
+    contentFilter: false,
+    errorMessage: '',
+    outputTokens,
+    newType,
+  };
 }
 
 function extractContentRecursive(items, defaultType, stripReferenceMarkers = true) {
@@ -199,6 +302,151 @@ function extractContentRecursive(items, defaultType, stripReferenceMarkers = tru
   return { parts, finished: false };
 }
 
+function filterLeakedContentFilterParts(parts) {
+  if (!Array.isArray(parts) || parts.length === 0) {
+    return parts;
+  }
+  const out = [];
+  for (const p of parts) {
+    if (!p || typeof p !== 'object') {
+      continue;
+    }
+    const { text, stripped } = stripLeakedContentFilterSuffix(p.text);
+    if (stripped && shouldDropCleanedLeakedChunk(text)) {
+      continue;
+    }
+    if (stripped) {
+      out.push({ ...p, text });
+      continue;
+    }
+    out.push(p);
+  }
+  return out;
+}
+
+function stripLeakedContentFilterSuffix(text) {
+  if (typeof text !== 'string' || text === '') {
+    return { text, stripped: false };
+  }
+  const upperText = text.toUpperCase();
+  const idx = upperText.indexOf('CONTENT_FILTER');
+  if (idx < 0) {
+    return { text, stripped: false };
+  }
+  return {
+    text: text.slice(0, idx).replace(/[ \t\r]+$/g, ''),
+    stripped: true,
+  };
+}
+
+function shouldDropCleanedLeakedChunk(cleaned) {
+  if (cleaned === '') {
+    return true;
+  }
+  if (typeof cleaned === 'string' && cleaned.includes('\n')) {
+    return false;
+  }
+  return asString(cleaned).trim() === '';
+}
+
+function hasContentFilterStatus(chunk) {
+  if (!chunk || typeof chunk !== 'object') {
+    return false;
+  }
+  const code = asString(chunk.code);
+  if (code && code.toLowerCase() === 'content_filter') {
+    return true;
+  }
+  return hasContentFilterStatusValue(chunk);
+}
+
+function hasContentFilterStatusValue(v) {
+  if (Array.isArray(v)) {
+    for (const item of v) {
+      if (hasContentFilterStatusValue(item)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (!v || typeof v !== 'object') {
+    return false;
+  }
+  const pathValue = asString(v.p);
+  if (pathValue && pathValue.toLowerCase().includes('status')) {
+    if (asString(v.v).toLowerCase() === 'content_filter') {
+      return true;
+    }
+  }
+  if (asString(v.code).toLowerCase() === 'content_filter') {
+    return true;
+  }
+  for (const value of Object.values(v)) {
+    if (hasContentFilterStatusValue(value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function extractAccumulatedTokenUsage(chunk) {
+  return findAccumulatedTokenUsage(chunk);
+}
+
+function findAccumulatedTokenUsage(v) {
+  if (Array.isArray(v)) {
+    for (const item of v) {
+      const n = findAccumulatedTokenUsage(item);
+      if (n > 0) {
+        return n;
+      }
+    }
+    return 0;
+  }
+  if (!v || typeof v !== 'object') {
+    return 0;
+  }
+  const pathValue = asString(v.p);
+  if (pathValue && pathValue.toLowerCase().includes('accumulated_token_usage')) {
+    const n = toInt(v.v);
+    if (n > 0) {
+      return n;
+    }
+  }
+  const direct = toInt(v.accumulated_token_usage);
+  if (direct > 0) {
+    return direct;
+  }
+  for (const value of Object.values(v)) {
+    const n = findAccumulatedTokenUsage(value);
+    if (n > 0) {
+      return n;
+    }
+  }
+  return 0;
+}
+
+function toInt(v) {
+  if (typeof v !== 'number' || !Number.isFinite(v)) {
+    return 0;
+  }
+  return Math.trunc(v);
+}
+
+function formatErrorMessage(v) {
+  if (typeof v === 'string') {
+    return v;
+  }
+  if (v == null) {
+    return String(v);
+  }
+  try {
+    return JSON.stringify(v);
+  } catch (_err) {
+    return String(v);
+  }
+}
+
 function shouldSkipPath(pathValue) {
   if (isFragmentStatusPath(pathValue)) {
     return true;
@@ -275,6 +523,9 @@ function asString(v) {
 module.exports = {
   parseChunkForContent,
   extractContentRecursive,
+  filterLeakedContentFilterParts,
+  hasContentFilterStatus,
+  extractAccumulatedTokenUsage,
   shouldSkipPath,
   isFragmentStatusPath,
   isCitation,

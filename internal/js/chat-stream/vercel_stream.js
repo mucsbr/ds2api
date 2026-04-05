@@ -23,7 +23,6 @@ const {
   isAbortError,
   fetchStreamPrepare,
   relayPreparedFailure,
-  safeReadText,
   createLeaseReleaser,
 } = require('./http_internal');
 
@@ -102,8 +101,9 @@ async function handleVercelStream(req, res, rawBody, payload) {
     }
 
     if (!completionRes.ok || !completionRes.body) {
-      const detail = await safeReadText(completionRes);
-      writeOpenAIError(res, 500, detail ? `Failed to get completion: ${detail}` : 'Failed to get completion.');
+      const detail = completionRes.body ? await completionRes.text() : '';
+      const status = completionRes.ok ? 500 : completionRes.status || 500;
+      writeOpenAIError(res, status, detail);
       return;
     }
 
@@ -120,6 +120,7 @@ async function handleVercelStream(req, res, rawBody, payload) {
     let currentType = thinkingEnabled ? 'thinking' : 'text';
     let thinkingText = '';
     let outputText = '';
+    let outputTokens = 0;
     const toolSieveEnabled = toolPolicy.toolSieveEnabled;
     const toolSieveState = createToolSieveState();
     let toolCallsEmitted = false;
@@ -172,7 +173,7 @@ async function handleVercelStream(req, res, rawBody, payload) {
         created,
         model,
         choices: [{ delta: {}, index: 0, finish_reason: reason }],
-        usage: buildUsage(finalPrompt, thinkingText, outputText),
+        usage: buildUsage(finalPrompt, thinkingText, outputText, outputTokens),
       });
       if (!res.writableEnded && !res.destroyed) {
         res.write('data: [DONE]\n\n');
@@ -217,12 +218,22 @@ async function handleVercelStream(req, res, rawBody, payload) {
           } catch (_err) {
             continue;
           }
-          if (chunk.error || chunk.code === 'content_filter') {
+          const parsed = parseChunkForContent(chunk, thinkingEnabled, currentType, stripReferenceMarkers);
+          if (!parsed.parsed) {
+            continue;
+          }
+          if (parsed.outputTokens > 0) {
+            outputTokens = parsed.outputTokens;
+          }
+          currentType = parsed.newType;
+          if (parsed.errorMessage) {
             await finish('content_filter');
             return;
           }
-          const parsed = parseChunkForContent(chunk, thinkingEnabled, currentType, stripReferenceMarkers);
-          currentType = parsed.newType;
+          if (parsed.contentFilter) {
+            await finish('stop');
+            return;
+          }
           if (parsed.finished) {
             await finish('stop');
             return;
