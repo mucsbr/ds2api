@@ -59,8 +59,11 @@ func TestBuildOpenAIHistoryTranscriptPreservesOrderAndToolHistory(t *testing.T) 
 	if !strings.Contains(transcript, "tool_call_id=call-1") {
 		t.Fatalf("expected tool call id in transcript, got %s", transcript)
 	}
-	if strings.Contains(transcript, "hidden reasoning") {
-		t.Fatalf("did not expect hidden reasoning in transcript, got %s", transcript)
+	if !strings.Contains(transcript, "[reasoning_content]") {
+		t.Fatalf("expected reasoning block in HISTORY.txt, got %s", transcript)
+	}
+	if !strings.Contains(transcript, "hidden reasoning") {
+		t.Fatalf("expected reasoning text in HISTORY.txt, got %s", transcript)
 	}
 
 	userIdx := strings.Index(transcript, "=== 1. USER ===")
@@ -72,13 +75,23 @@ func TestBuildOpenAIHistoryTranscriptPreservesOrderAndToolHistory(t *testing.T) 
 	if userIdx >= assistantIdx || assistantIdx >= toolIdx {
 		t.Fatalf("expected USER -> ASSISTANT -> TOOL order, got %s", transcript)
 	}
+	if reasoningIdx := strings.Index(transcript, "[reasoning_content]"); reasoningIdx < 0 || reasoningIdx > strings.Index(transcript, "<tool_calls>") {
+		t.Fatalf("expected reasoning block before tool calls, got %s", transcript)
+	}
+	reasoning := extractHistorySplitReasoningContent(historyMessages)
+	if reasoning != "hidden reasoning" {
+		t.Fatalf("expected latest assistant reasoning to be extracted, got %q", reasoning)
+	}
 
-	finalPrompt, _ := buildHistorySplitPrompt(promptMessages, nil, util.DefaultToolChoicePolicy(), false)
+	finalPrompt, _ := buildHistorySplitPrompt(promptMessages, reasoning, nil, util.DefaultToolChoicePolicy(), false)
 	if !strings.Contains(finalPrompt, "latest user turn") {
 		t.Fatalf("expected latest user turn in final prompt, got %s", finalPrompt)
 	}
 	if strings.Contains(finalPrompt, "first user turn") {
 		t.Fatalf("expected earlier history to be removed from final prompt, got %s", finalPrompt)
+	}
+	if !strings.Contains(finalPrompt, "[reasoning_content]") || !strings.Contains(finalPrompt, "hidden reasoning") {
+		t.Fatalf("expected latest assistant reasoning to be attached to prompt, got %s", finalPrompt)
 	}
 	if !strings.Contains(finalPrompt, "HISTORY.txt") {
 		t.Fatalf("expected history instruction in final prompt, got %s", finalPrompt)
@@ -118,8 +131,12 @@ func TestSplitOpenAIHistoryMessagesUsesLatestUserTurn(t *testing.T) {
 	if len(promptMessages) == 0 || len(historyMessages) == 0 {
 		t.Fatalf("expected both prompt and history messages, got prompt=%d history=%d", len(promptMessages), len(historyMessages))
 	}
+	reasoning := extractHistorySplitReasoningContent(historyMessages)
+	if reasoning != "" {
+		t.Fatalf("expected no reasoning in this fixture, got %q", reasoning)
+	}
 
-	promptText := buildOpenAIFinalPromptForSplitTest(promptMessages)
+	promptText, _ := buildHistorySplitPrompt(promptMessages, reasoning, nil, util.DefaultToolChoicePolicy(), false)
 	if !strings.Contains(promptText, "latest user turn") {
 		t.Fatalf("expected latest user turn in prompt, got %s", promptText)
 	}
@@ -134,11 +151,6 @@ func TestSplitOpenAIHistoryMessagesUsesLatestUserTurn(t *testing.T) {
 	if strings.Contains(historyText, "latest user turn") {
 		t.Fatalf("expected latest user turn to remain in prompt, got %s", historyText)
 	}
-}
-
-func buildOpenAIFinalPromptForSplitTest(messages []any) string {
-	prompt, _ := buildHistorySplitPrompt(messages, nil, util.DefaultToolChoicePolicy(), false)
-	return prompt
 }
 
 func TestApplyHistorySplitSkipsFirstTurn(t *testing.T) {
@@ -233,6 +245,9 @@ func TestChatCompletionsHistorySplitUploadsHistoryAndKeepsLatestPrompt(t *testin
 	if strings.Contains(promptText, "first user turn") {
 		t.Fatalf("expected historical turns removed from completion prompt, got %s", promptText)
 	}
+	if !strings.Contains(promptText, "[reasoning_content]") || !strings.Contains(promptText, "hidden reasoning") {
+		t.Fatalf("expected latest assistant reasoning to be attached to completion prompt, got %s", promptText)
+	}
 	if !strings.Contains(promptText, "HISTORY.txt") {
 		t.Fatalf("expected history instruction in completion prompt, got %s", promptText)
 	}
@@ -282,6 +297,9 @@ func TestResponsesHistorySplitUploadsHistoryAndKeepsLatestPrompt(t *testing.T) {
 	}
 	if strings.Contains(promptText, "first user turn") {
 		t.Fatalf("expected historical turns removed from completion prompt, got %s", promptText)
+	}
+	if !strings.Contains(promptText, "[reasoning_content]") || !strings.Contains(promptText, "hidden reasoning") {
+		t.Fatalf("expected latest assistant reasoning to be attached to completion prompt, got %s", promptText)
 	}
 }
 

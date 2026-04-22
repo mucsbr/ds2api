@@ -42,6 +42,49 @@ func TestProcessToolSieveInterceptsXMLToolCallWithoutLeak(t *testing.T) {
 	}
 }
 
+func TestProcessToolSieveHandlesLongXMLToolCall(t *testing.T) {
+	var state toolStreamSieveState
+	const toolName = "write_to_file"
+	payload := strings.Repeat("x", 4096)
+	splitAt := len(payload) / 2
+	chunks := []string{
+		"<tool_calls>\n  <tool_call>\n    <tool_name>" + toolName + "</tool_name>\n    <parameters>\n      <content><![CDATA[",
+		payload[:splitAt],
+		payload[splitAt:],
+		"]]></content>\n    </parameters>\n  </tool_call>\n</tool_calls>",
+	}
+
+	var events []toolStreamEvent
+	for _, c := range chunks {
+		events = append(events, processToolSieveChunk(&state, c, []string{toolName})...)
+	}
+	events = append(events, flushToolSieve(&state, []string{toolName})...)
+
+	var textContent strings.Builder
+	toolCalls := 0
+	var gotPayload any
+	for _, evt := range events {
+		if evt.Content != "" {
+			textContent.WriteString(evt.Content)
+		}
+		if len(evt.ToolCalls) > 0 && gotPayload == nil {
+			gotPayload = evt.ToolCalls[0].Input["content"]
+		}
+		toolCalls += len(evt.ToolCalls)
+	}
+
+	if toolCalls != 1 {
+		t.Fatalf("expected one long XML tool call, got %d events=%#v", toolCalls, events)
+	}
+	if textContent.Len() != 0 {
+		t.Fatalf("expected no leaked text for long XML tool call, got %q", textContent.String())
+	}
+	got, _ := gotPayload.(string)
+	if got != payload {
+		t.Fatalf("expected long XML payload to survive intact, got len=%d want=%d", len(got), len(payload))
+	}
+}
+
 func TestProcessToolSieveXMLWithLeadingText(t *testing.T) {
 	var state toolStreamSieveState
 	// Model outputs some prose then an XML tool call.

@@ -30,6 +30,7 @@ func (h *Handler) applyHistorySplit(ctx context.Context, a *auth.RequestAuth, st
 		return stdReq, nil
 	}
 
+	reasoningContent := extractHistorySplitReasoningContent(historyMessages)
 	historyText := buildOpenAIHistoryTranscript(historyMessages)
 	if strings.TrimSpace(historyText) == "" {
 		return stdReq, errors.New("history split produced empty transcript")
@@ -51,12 +52,12 @@ func (h *Handler) applyHistorySplit(ctx context.Context, a *auth.RequestAuth, st
 
 	stdReq.Messages = promptMessages
 	stdReq.RefFileIDs = prependUniqueRefFileID(stdReq.RefFileIDs, fileID)
-	stdReq.FinalPrompt, stdReq.ToolNames = buildHistorySplitPrompt(promptMessages, stdReq.ToolsRaw, stdReq.ToolChoice, stdReq.Thinking)
+	stdReq.FinalPrompt, stdReq.ToolNames = buildHistorySplitPrompt(promptMessages, reasoningContent, stdReq.ToolsRaw, stdReq.ToolChoice, stdReq.Thinking)
 	return stdReq, nil
 }
 
-func buildHistorySplitPrompt(messages []any, toolsRaw any, toolPolicy util.ToolChoicePolicy, thinkingEnabled bool) (string, []string) {
-	if len(messages) == 0 {
+func buildHistorySplitPrompt(messages []any, reasoningContent string, toolsRaw any, toolPolicy util.ToolChoicePolicy, thinkingEnabled bool) (string, []string) {
+	if len(messages) == 0 && strings.TrimSpace(reasoningContent) == "" {
 		return "", nil
 	}
 	instruction := historySplitPromptInstruction()
@@ -65,7 +66,7 @@ func buildHistorySplitPrompt(messages []any, toolsRaw any, toolPolicy util.ToolC
 		"role":    "system",
 		"content": instruction,
 	})
-	withInstruction = append(withInstruction, messages...)
+	withInstruction = append(withInstruction, injectHistorySplitReasoningMessage(messages, reasoningContent)...)
 	return buildOpenAIFinalPromptWithPolicy(withInstruction, toolsRaw, "", toolPolicy, thinkingEnabled)
 }
 
@@ -150,7 +151,7 @@ func buildOpenAIHistoryTranscript(messages []any) string {
 func buildOpenAIHistoryEntry(role string, msg map[string]any) string {
 	switch role {
 	case "assistant":
-		return strings.TrimSpace(buildAssistantContentForPrompt(msg))
+		return strings.TrimSpace(buildAssistantHistoryContent(msg))
 	case "tool", "function":
 		return strings.TrimSpace(buildToolHistoryContent(msg))
 	case "user":
@@ -158,6 +159,10 @@ func buildOpenAIHistoryEntry(role string, msg map[string]any) string {
 	default:
 		return strings.TrimSpace(normalizeOpenAIContentForPrompt(msg["content"]))
 	}
+}
+
+func buildAssistantHistoryContent(msg map[string]any) string {
+	return strings.TrimSpace(buildAssistantContentForPrompt(msg))
 }
 
 func buildToolHistoryContent(msg map[string]any) string {
@@ -181,6 +186,68 @@ func buildToolHistoryContent(msg map[string]any) string {
 	default:
 		return content
 	}
+}
+
+func extractHistorySplitReasoningContent(messages []any) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg, ok := messages[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		role := strings.ToLower(strings.TrimSpace(asString(msg["role"])))
+		if role != "assistant" {
+			continue
+		}
+		reasoning := strings.TrimSpace(normalizeOpenAIReasoningContentForPrompt(msg["reasoning_content"]))
+		if reasoning == "" {
+			reasoning = strings.TrimSpace(extractOpenAIReasoningContentFromMessage(msg["content"]))
+		}
+		if reasoning != "" {
+			return reasoning
+		}
+	}
+	return ""
+}
+
+func injectHistorySplitReasoningMessage(messages []any, reasoningContent string) []any {
+	reasoningContent = strings.TrimSpace(reasoningContent)
+	if reasoningContent == "" {
+		return messages
+	}
+	reasoningMsg := map[string]any{
+		"role":              "assistant",
+		"content":           "",
+		"reasoning_content": reasoningContent,
+	}
+	lastUserIndex := lastOpenAIUserMessageIndex(messages)
+	if lastUserIndex < 0 {
+		out := make([]any, 0, len(messages)+1)
+		out = append(out, reasoningMsg)
+		out = append(out, messages...)
+		return out
+	}
+	out := make([]any, 0, len(messages)+1)
+	for i, raw := range messages {
+		if i == lastUserIndex {
+			out = append(out, reasoningMsg)
+		}
+		out = append(out, raw)
+	}
+	return out
+}
+
+func lastOpenAIUserMessageIndex(messages []any) int {
+	last := -1
+	for i, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(asString(msg["role"]))) == "user" {
+			last = i
+		}
+	}
+	return last
 }
 
 func roleLabelForHistory(role string) string {

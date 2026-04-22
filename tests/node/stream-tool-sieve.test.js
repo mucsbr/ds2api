@@ -98,6 +98,26 @@ test('sieve emits tool_calls when XML tag spans multiple chunks', () => {
   assert.equal(finalCalls[0].name, 'read_file');
 });
 
+test('sieve keeps long XML tool calls buffered until the closing tag arrives', () => {
+  const longContent = 'x'.repeat(4096);
+  const splitAt = longContent.length / 2;
+  const events = runSieve(
+    [
+      '<tool_calls>\n  <tool_call>\n    <tool_name>write_to_file</tool_name>\n    <parameters>\n      <content><![CDATA[',
+      longContent.slice(0, splitAt),
+      longContent.slice(splitAt),
+      ']]></content>\n    </parameters>\n  </tool_call>\n</tool_calls>',
+    ],
+    ['write_to_file'],
+  );
+  const leakedText = collectText(events);
+  const finalCalls = events.filter((evt) => evt.type === 'tool_calls').flatMap((evt) => evt.calls || []);
+  assert.equal(leakedText, '');
+  assert.equal(finalCalls.length, 1);
+  assert.equal(finalCalls[0].name, 'write_to_file');
+  assert.equal(finalCalls[0].input.content, longContent);
+});
+
 test('sieve passes JSON tool_calls payload through as text (XML-only)', () => {
   const events = runSieve(
     ['{"tool_calls":[{"name":"read_file","input":{"path":"README.MD"}}]}'],

@@ -12,7 +12,6 @@ type toolStreamSieveState struct {
 	codeFenceStack        []int
 	codeFencePendingTicks int
 	codeFenceLineStart    bool
-	recentTextTail        string
 	pendingToolRaw        string
 	pendingToolCalls      []toolcall.ParsedToolCall
 	disableDeltas         bool
@@ -36,9 +35,6 @@ type toolCallDelta struct {
 	Arguments string
 }
 
-// Keep in sync with JS TOOL_SIEVE_CONTEXT_TAIL_LIMIT.
-const toolSieveContextTailLimit = 2048
-
 func (s *toolStreamSieveState) resetIncrementalToolState() {
 	s.disableDeltas = false
 	s.toolNameSent = false
@@ -54,18 +50,6 @@ func (s *toolStreamSieveState) noteText(content string) {
 		return
 	}
 	updateCodeFenceState(s, content)
-	s.recentTextTail = appendTail(s.recentTextTail, content, toolSieveContextTailLimit)
-}
-
-func appendTail(prev, next string, max int) string {
-	if max <= 0 {
-		return ""
-	}
-	combined := prev + next
-	if len(combined) <= max {
-		return combined
-	}
-	return combined[len(combined)-max:]
 }
 
 func hasMeaningfulText(text string) bool {
