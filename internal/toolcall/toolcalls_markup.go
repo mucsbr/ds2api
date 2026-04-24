@@ -8,14 +8,19 @@ import (
 )
 
 var toolCallMarkupTagNames = []string{"tool_call", "function_call", "invoke"}
+var toolCallMarkupWrapperTagNames = []string{"tool_calls", "function_calls"}
 var toolCallMarkupTagPatternByName = map[string]*regexp.Regexp{
 	"tool_call":     regexp.MustCompile(`(?is)<(?:[a-z0-9_:-]+:)?tool_call\b([^>]*)>(.*?)</(?:[a-z0-9_:-]+:)?tool_call>`),
 	"function_call": regexp.MustCompile(`(?is)<(?:[a-z0-9_:-]+:)?function_call\b([^>]*)>(.*?)</(?:[a-z0-9_:-]+:)?function_call>`),
 	"invoke":        regexp.MustCompile(`(?is)<(?:[a-z0-9_:-]+:)?invoke\b([^>]*)>(.*?)</(?:[a-z0-9_:-]+:)?invoke>`),
 }
+var toolCallMarkupWrapperPatternByName = map[string]*regexp.Regexp{
+	"tool_calls":     regexp.MustCompile(`(?is)<(?:[a-z0-9_:-]+:)?tool_calls\b[^>]*>(.*?)</(?:[a-z0-9_:-]+:)?tool_calls>`),
+	"function_calls": regexp.MustCompile(`(?is)<(?:[a-z0-9_:-]+:)?function_calls\b[^>]*>(.*?)</(?:[a-z0-9_:-]+:)?function_calls>`),
+}
 var toolCallMarkupSelfClosingPattern = regexp.MustCompile(`(?is)<(?:[a-z0-9_:-]+:)?invoke\b([^>]*)/>`)
 var toolCallMarkupKVPattern = regexp.MustCompile(`(?is)<(?:[a-z0-9_:-]+:)?([a-z0-9_\-.]+)\b[^>]*>(.*?)</(?:[a-z0-9_:-]+:)?([a-z0-9_\-.]+)>`)
-var toolCallMarkupAttrPattern = regexp.MustCompile(`(?is)(name|function|tool)\s*=\s*"([^"]+)"`)
+var toolCallMarkupAttrPattern = regexp.MustCompile(`(?is)(name|function|tool)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))`)
 var anyTagPattern = regexp.MustCompile(`(?is)<[^>]+>`)
 var toolCallMarkupNameTagNames = []string{"name", "function"}
 var toolCallMarkupNamePatternByTag = map[string]*regexp.Regexp{
@@ -65,6 +70,9 @@ func parseMarkupToolCalls(text string) []ParsedToolCall {
 		}
 	}
 	if len(out) == 0 {
+		if recovered := parseWrapperNamedTagToolCalls(trimmed); len(recovered) > 0 {
+			return recovered
+		}
 		return nil
 	}
 	return out
@@ -99,11 +107,11 @@ func parseMarkupSingleToolCall(attrs string, inner string) ParsedToolCall {
 	}
 
 	name := ""
-	if m := toolCallMarkupAttrPattern.FindStringSubmatch(attrs); len(m) >= 3 {
-		name = strings.TrimSpace(m[2])
+	if attrName := extractMarkupAttrName(attrs); attrName != "" {
+		name = attrName
 	}
 	if name == "" {
-		name = findMarkupTagValue(inner, toolCallMarkupNameTagNames, toolCallMarkupNamePatternByTag)
+		name = sanitizeToolName(findMarkupTagValue(inner, toolCallMarkupNameTagNames, toolCallMarkupNamePatternByTag))
 	}
 	if name == "" {
 		return ParsedToolCall{}
@@ -187,6 +195,95 @@ func appendMarkupValue(out map[string]any, key string, value any) {
 		return
 	}
 	out[key] = value
+}
+
+func extractMarkupAttrName(attrs string) string {
+	m := toolCallMarkupAttrPattern.FindStringSubmatch(attrs)
+	if len(m) == 0 {
+		return ""
+	}
+	for i := 2; i < len(m); i++ {
+		if strings.TrimSpace(m[i]) != "" {
+			return sanitizeToolName(m[i])
+		}
+	}
+	return ""
+}
+
+func sanitizeToolName(raw string) string {
+	name := strings.TrimSpace(html.UnescapeString(raw))
+	name = strings.Trim(name, "`'\" ")
+	for len(name) > 0 {
+		last := name[len(name)-1]
+		if (last >= 'a' && last <= 'z') || (last >= 'A' && last <= 'Z') || (last >= '0' && last <= '9') || last == '_' || last == '-' || last == '.' || last == ':' {
+			break
+		}
+		name = strings.TrimSpace(name[:len(name)-1])
+	}
+	return name
+}
+
+func parseWrapperNamedTagToolCalls(text string) []ParsedToolCall {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return nil
+	}
+	for _, wrapper := range toolCallMarkupWrapperTagNames {
+		pattern := toolCallMarkupWrapperPatternByName[wrapper]
+		if pattern == nil {
+			continue
+		}
+		for _, m := range pattern.FindAllStringSubmatch(trimmed, -1) {
+			if len(m) < 2 {
+				continue
+			}
+			if call, ok := parseWrapperNamedTagSingle(strings.TrimSpace(m[1])); ok {
+				return []ParsedToolCall{call}
+			}
+		}
+	}
+	return nil
+}
+
+func parseWrapperNamedTagSingle(inner string) (ParsedToolCall, bool) {
+	body := strings.TrimSpace(inner)
+	if body == "" {
+		return ParsedToolCall{}, false
+	}
+	start := strings.Index(body, "<")
+	if start < 0 || start+1 >= len(body) {
+		return ParsedToolCall{}, false
+	}
+	segment := body[start+1:]
+	end := strings.IndexAny(segment, " \t\r\n>/")
+	if end < 0 {
+		return ParsedToolCall{}, false
+	}
+	name := sanitizeToolName(segment[:end])
+	if name == "" {
+		return ParsedToolCall{}, false
+	}
+	lower := strings.ToLower(name)
+	for _, reserved := range append(toolCallMarkupTagNames, toolCallMarkupWrapperTagNames...) {
+		if lower == reserved {
+			return ParsedToolCall{}, false
+		}
+	}
+	pattern := regexp.MustCompile(`(?is)<(?:[a-z0-9_:-]+:)?` + regexp.QuoteMeta(name) + `\b[^>]*>(.*?)</(?:[a-z0-9_:-]+:)?` + regexp.QuoteMeta(name) + `>`)
+	m := pattern.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return ParsedToolCall{}, false
+	}
+	content := strings.TrimSpace(m[1])
+	input := map[string]any{}
+	if argsRaw := findMarkupTagValue(content, toolCallMarkupArgsTagNames, toolCallMarkupArgsPatternByTag); argsRaw != "" {
+		input = parseMarkupInput(argsRaw)
+	} else if kv := parseMarkupKVObject(content); len(kv) > 0 {
+		input = kv
+	} else if parsed := parseStructuredToolCallInput(content); len(parsed) > 0 && !isOnlyRawValue(parsed, content) {
+		input = parsed
+	}
+	return ParsedToolCall{Name: name, Input: input}, true
 }
 
 // extractRawTagValue treats the inner content of a tag robustly.

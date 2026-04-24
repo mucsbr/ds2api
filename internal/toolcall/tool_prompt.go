@@ -54,6 +54,7 @@ RULES:
 6) Numbers, booleans, and null stay plain text.
 7) Use only the parameter names in the tool schema. Do not invent fields.
 8) Do NOT wrap XML in markdown fences. Do NOT output explanations, role markers, or internal monologue.
+9) Put the tool name only inside <tool_name>...</tool_name>. Do NOT use the tool name itself as an XML tag.
 
 PARAMETER SHAPES:
 - string => <name><![CDATA[value]]></name>
@@ -73,6 +74,12 @@ Wrong 4 — Markdown code fences:
   ` + "```xml" + `
   <tool_calls>...</tool_calls>
   ` + "```" + `
+Wrong 5 — using the tool name as the XML tag:
+  <tool_calls><` + ex1 + `><path>README.md</path></` + ex1 + `></tool_calls>
+Wrong 6 — malformed tool name attribute:
+  <tool_call name="` + ex1 + "`" + `><parameters><path>README.md</path></parameters></tool_call>
+Wrong 7 — mixing wrapper names:
+  <tool_call><tool_calls>...</tool_calls></tool_call>
 
 Remember: The ONLY valid way to use tools is the <tool_calls> XML block at the end of your response.
 
@@ -105,7 +112,7 @@ Example C — Tool with nested XML parameters:
     <parameters>` + ex3Params + `</parameters>
   </tool_call>
 </tool_calls>
- 
+
 Example D — Tool with long script using CDATA (RELIABLE FOR CODE/SCRIPTS):
 <tool_calls>
   <tool_call>

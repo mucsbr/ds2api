@@ -96,6 +96,10 @@ func GetModelConfig(model string) (thinking bool, search bool, ok bool) {
 		return false, true, true
 	case "deepseek-vision-reasoner-search":
 		return true, true, true
+	case "deepseek-v4-flash":
+		return true, true, true
+	case "deepseek-v4-pro":
+		return true, true, true
 	default:
 		return false, false, false
 	}

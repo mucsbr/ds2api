@@ -123,7 +123,7 @@ func parseSingleXMLToolCall(block string) (ParsedToolCall, bool) {
 			case "tool_name", "function_name", "name":
 				var v string
 				if err := dec.DecodeElement(&v, &t); err == nil && strings.TrimSpace(v) != "" {
-					name = strings.TrimSpace(v)
+					name = sanitizeToolName(v)
 				}
 			case "input", "arguments", "argument", "args", "params":
 				var v string
@@ -150,12 +150,12 @@ func parseSingleXMLToolCall(block string) (ParsedToolCall, bool) {
 		}
 	}
 	if strings.TrimSpace(name) == "" {
-		name = strings.TrimSpace(html.UnescapeString(extractXMLToolNameByRegex(stripTopLevelXMLParameters(inner))))
+		name = sanitizeToolName(extractXMLToolNameByRegex(stripTopLevelXMLParameters(inner)))
 	}
 	if strings.TrimSpace(name) == "" {
 		return ParsedToolCall{}, false
 	}
-	return ParsedToolCall{Name: strings.TrimSpace(html.UnescapeString(name)), Input: params}, true
+	return ParsedToolCall{Name: sanitizeToolName(name), Input: params}, true
 }
 
 func stripTopLevelXMLParameters(inner string) string {
@@ -208,7 +208,7 @@ func parseFunctionCallTagStyle(text string) (ParsedToolCall, bool) {
 	if len(m) < 2 {
 		return ParsedToolCall{}, false
 	}
-	name := strings.TrimSpace(html.UnescapeString(m[1]))
+	name := sanitizeToolName(strings.TrimSpace(html.UnescapeString(m[1])))
 	if name == "" {
 		return ParsedToolCall{}, false
 	}
@@ -253,7 +253,7 @@ func parseSingleAntmlFunctionCallMatch(m []string) (ParsedToolCall, bool) {
 	if len(m) < 3 {
 		return ParsedToolCall{}, false
 	}
-	name := strings.TrimSpace(html.UnescapeString(m[1]))
+	name := sanitizeToolName(strings.TrimSpace(html.UnescapeString(m[1])))
 	if name == "" {
 		return ParsedToolCall{}, false
 	}
@@ -295,7 +295,7 @@ func parseInvokeFunctionCallStyle(text string) (ParsedToolCall, bool) {
 	if len(m) < 3 {
 		return ParsedToolCall{}, false
 	}
-	name := strings.TrimSpace(html.UnescapeString(m[1]))
+	name := sanitizeToolName(strings.TrimSpace(html.UnescapeString(m[1])))
 	if name == "" {
 		return ParsedToolCall{}, false
 	}
@@ -333,7 +333,7 @@ func parseToolUseFunctionStyle(text string) (ParsedToolCall, bool) {
 	if len(m) < 3 {
 		return ParsedToolCall{}, false
 	}
-	name := strings.TrimSpace(html.UnescapeString(m[1]))
+	name := sanitizeToolName(strings.TrimSpace(html.UnescapeString(m[1])))
 	if name == "" {
 		return ParsedToolCall{}, false
 	}
@@ -363,7 +363,7 @@ func parseToolUseNameParametersStyle(text string) (ParsedToolCall, bool) {
 	if len(m) < 3 {
 		return ParsedToolCall{}, false
 	}
-	name := strings.TrimSpace(html.UnescapeString(m[1]))
+	name := sanitizeToolName(strings.TrimSpace(html.UnescapeString(m[1])))
 	if name == "" {
 		return ParsedToolCall{}, false
 	}
@@ -382,7 +382,7 @@ func parseToolUseFunctionNameParametersStyle(text string) (ParsedToolCall, bool)
 	if len(m) < 3 {
 		return ParsedToolCall{}, false
 	}
-	name := strings.TrimSpace(html.UnescapeString(m[1]))
+	name := sanitizeToolName(strings.TrimSpace(html.UnescapeString(m[1])))
 	if name == "" {
 		return ParsedToolCall{}, false
 	}
@@ -401,7 +401,7 @@ func parseToolUseToolNameBodyStyle(text string) (ParsedToolCall, bool) {
 	if len(m) < 3 {
 		return ParsedToolCall{}, false
 	}
-	name := strings.TrimSpace(html.UnescapeString(m[1]))
+	name := sanitizeToolName(strings.TrimSpace(html.UnescapeString(m[1])))
 	if name == "" {
 		return ParsedToolCall{}, false
 	}

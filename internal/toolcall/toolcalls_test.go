@@ -291,11 +291,31 @@ func TestParseToolCallsSupportsMultipleAntmlFunctionCalls(t *testing.T) {
 	}
 }
 
-func TestParseToolCallsDoesNotAcceptMismatchedMarkupTags(t *testing.T) {
-	text := `<tool_call><name>read_file</function><arguments>{"path":"README.md"}</arguments></tool_call>`
+func TestParseToolCallsRecoversWrapperNamedToolTagStyle(t *testing.T) {
+	text := `<tool_calls><read_file><path>README.md</path></read_file></tool_calls>`
 	calls := ParseToolCalls(text, []string{"read_file"})
-	if len(calls) != 0 {
-		t.Fatalf("expected mismatched tags to be rejected, got %#v", calls)
+	if len(calls) != 1 {
+		t.Fatalf("expected wrapper-named tag style to recover one call, got %#v", calls)
+	}
+	if calls[0].Name != "read_file" {
+		t.Fatalf("expected recovered tool name read_file, got %q", calls[0].Name)
+	}
+	if calls[0].Input["path"] != "README.md" {
+		t.Fatalf("expected recovered path argument, got %#v", calls[0].Input)
+	}
+}
+
+func TestParseToolCallsSanitizesMalformedToolNameAttribute(t *testing.T) {
+	text := "<tool_call name=\"read_file`\"><parameters><path>README.md</path></parameters></tool_call>"
+	calls := ParseToolCalls(text, []string{"read_file"})
+	if len(calls) != 1 {
+		t.Fatalf("expected malformed attribute style to recover one call, got %#v", calls)
+	}
+	if calls[0].Name != "read_file" {
+		t.Fatalf("expected sanitized tool name read_file, got %q", calls[0].Name)
+	}
+	if calls[0].Input["path"] != "README.md" {
+		t.Fatalf("expected recovered path argument, got %#v", calls[0].Input)
 	}
 }
 

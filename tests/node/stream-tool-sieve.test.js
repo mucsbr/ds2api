@@ -68,11 +68,20 @@ test('parseToolCalls ignores tool_call payloads that exist only inside fenced co
   assert.equal(calls.length, 0);
 });
 
-test('parseToolCalls keeps unknown schema names when toolNames is provided', () => {
-  const payload = '<tool_call><tool_name>not_in_schema</tool_name><parameters>{"q":"go"}</parameters></tool_call>';
-  const calls = parseToolCalls(payload, ['search']);
+test('parseToolCalls recovers wrapper-named tool tag style', () => {
+  const payload = '<tool_calls><read_file><path>README.md</path></read_file></tool_calls>';
+  const calls = parseToolCalls(payload, ['read_file']);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].name, 'not_in_schema');
+  assert.equal(calls[0].name, 'read_file');
+  assert.deepEqual(calls[0].input, { path: 'README.md' });
+});
+
+test('parseToolCalls sanitizes malformed tool name attribute', () => {
+  const payload = '<tool_call name="read_file`"><parameters><path>README.md</path></parameters></tool_call>';
+  const calls = parseToolCalls(payload, ['read_file']);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, 'read_file');
+  assert.deepEqual(calls[0].input, { path: 'README.md' });
 });
 
 test('sieve emits tool_calls for XML tool call payload', () => {
@@ -85,17 +94,26 @@ test('sieve emits tool_calls for XML tool call payload', () => {
   assert.equal(finalCalls[0].name, 'read_file');
 });
 
-test('sieve emits tool_calls when XML tag spans multiple chunks', () => {
+test('sieve emits tool_calls for wrapper-named tool tag style', () => {
   const events = runSieve(
-    [
-      '<tool_call><tool_name>read_file</tool_name>',
-      '<parameters>{"path":"README.MD"}</parameters></tool_call>',
-    ],
+    ['<tool_calls><read_file><path>README.md</path></read_file></tool_calls>'],
     ['read_file'],
   );
   const finalCalls = events.filter((evt) => evt.type === 'tool_calls').flatMap((evt) => evt.calls || []);
   assert.equal(finalCalls.length, 1);
   assert.equal(finalCalls[0].name, 'read_file');
+  assert.deepEqual(finalCalls[0].input, { path: 'README.md' });
+});
+
+test('sieve emits tool_calls for malformed name attribute after sanitization', () => {
+  const events = runSieve(
+    ['<tool_call name="read_file`"><parameters><path>README.md</path></parameters></tool_call>'],
+    ['read_file'],
+  );
+  const finalCalls = events.filter((evt) => evt.type === 'tool_calls').flatMap((evt) => evt.calls || []);
+  assert.equal(finalCalls.length, 1);
+  assert.equal(finalCalls[0].name, 'read_file');
+  assert.deepEqual(finalCalls[0].input, { path: 'README.md' });
 });
 
 test('sieve keeps long XML tool calls buffered until the closing tag arrives', () => {
