@@ -79,14 +79,40 @@ func TestGetModelConfigDeepSeekVisionReasonerSearch(t *testing.T) {
 	}
 }
 
+func TestGetModelConfigDeepSeekV4Models(t *testing.T) {
+	thinking, search, ok := GetModelConfig("deepseek-v4-flash")
+	if !ok {
+		t.Fatal("expected ok for deepseek-v4-flash")
+	}
+	if !thinking || !search {
+		t.Fatalf("expected thinking=true search=true for deepseek-v4-flash, got thinking=%v search=%v", thinking, search)
+	}
+
+	thinking, search, ok = GetModelConfig("deepseek-v4-pro")
+	if !ok {
+		t.Fatal("expected ok for deepseek-v4-pro")
+	}
+	if !thinking || !search {
+		t.Fatalf("expected thinking=true search=true for deepseek-v4-pro, got thinking=%v search=%v", thinking, search)
+	}
+}
+
 func TestGetModelTypeDefaultExpertAndVision(t *testing.T) {
 	defaultType, ok := GetModelType("deepseek-chat")
 	if !ok || defaultType != "default" {
 		t.Fatalf("expected default model_type, got ok=%v model_type=%q", ok, defaultType)
 	}
+	defaultType, ok = GetModelType("deepseek-v4-flash")
+	if !ok || defaultType != "default" {
+		t.Fatalf("expected deepseek-v4-flash to map to default model_type, got ok=%v model_type=%q", ok, defaultType)
+	}
 	expertType, ok := GetModelType("deepseek-expert-chat")
 	if !ok || expertType != "expert" {
 		t.Fatalf("expected expert model_type, got ok=%v model_type=%q", ok, expertType)
+	}
+	expertType, ok = GetModelType("deepseek-v4-pro")
+	if !ok || expertType != "expert" {
+		t.Fatalf("expected deepseek-v4-pro to map to expert model_type, got ok=%v model_type=%q", ok, expertType)
 	}
 	visionType, ok := GetModelType("deepseek-vision-chat")
 	if !ok || visionType != "vision" {
