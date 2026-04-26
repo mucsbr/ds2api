@@ -12,8 +12,6 @@ type Config struct {
 	APIKeys          []APIKey           `json:"api_keys,omitempty"`
 	Accounts         []Account          `json:"accounts,omitempty"`
 	Proxies          []Proxy            `json:"proxies,omitempty"`
-	ClaudeMapping    map[string]string  `json:"claude_mapping,omitempty"`
-	ClaudeModelMap   map[string]string  `json:"claude_model_mapping,omitempty"`
 	ModelAliases     map[string]string  `json:"model_aliases,omitempty"`
 	Admin            AdminConfig        `json:"admin,omitempty"`
 	Runtime          RuntimeConfig      `json:"runtime,omitempty"`
@@ -100,6 +98,9 @@ func (c *Config) NormalizeCredentials() {
 		c.Accounts[i].Name = strings.TrimSpace(c.Accounts[i].Name)
 		c.Accounts[i].Remark = strings.TrimSpace(c.Accounts[i].Remark)
 	}
+
+	c.normalizeModelAliases()
+	c.forceHistorySplitEnabled()
 }
 
 // DropInvalidAccounts removes accounts that cannot be addressed by admin APIs
@@ -117,6 +118,35 @@ func (c *Config) DropInvalidAccounts() {
 		kept = append(kept, acc)
 	}
 	c.Accounts = kept
+}
+
+func (c *Config) normalizeModelAliases() {
+	if c == nil {
+		return
+	}
+
+	aliases := map[string]string{}
+	for k, v := range c.ModelAliases {
+		key := strings.TrimSpace(lower(k))
+		val := strings.TrimSpace(lower(v))
+		if key == "" || val == "" {
+			continue
+		}
+		aliases[key] = val
+	}
+	if len(aliases) == 0 {
+		c.ModelAliases = nil
+	} else {
+		c.ModelAliases = aliases
+	}
+}
+
+func (c *Config) forceHistorySplitEnabled() {
+	if c == nil {
+		return
+	}
+	enabled := true
+	c.HistorySplit.Enabled = &enabled
 }
 
 type CompatConfig struct {

@@ -9,15 +9,10 @@ export default function HistorySplitSection({ t, form, setForm }) {
                 <label className="flex items-start gap-3 rounded-lg border border-border bg-background/60 p-4">
                     <input
                         type="checkbox"
-                        checked={Boolean(form.history_split?.enabled ?? true)}
-                        onChange={(e) => setForm((prev) => ({
-                            ...prev,
-                            history_split: {
-                                ...prev.history_split,
-                                enabled: e.target.checked,
-                            },
-                        }))}
-                        className="mt-1 h-4 w-4 rounded border-border"
+                        checked
+                        disabled
+                        readOnly
+                        className="mt-1 h-4 w-4 rounded border-border disabled:opacity-70"
                     />
                     <div className="space-y-1">
                         <span className="text-sm font-medium block">{t('settings.historySplitEnabled')}</span>

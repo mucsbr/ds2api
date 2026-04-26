@@ -104,6 +104,18 @@ func TestConvertClaudeToDeepSeek(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeToDeepSeekUsesGlobalAliasResolution(t *testing.T) {
+	store := config.LoadStore()
+	req := map[string]any{
+		"model":    "claude-3-5-sonnet-latest",
+		"messages": []any{map[string]any{"role": "user", "content": "Hi"}},
+	}
+	out := ConvertClaudeToDeepSeek(req, store)
+	if out["model"] != "deepseek-v4-flash" {
+		t.Fatalf("expected global alias resolution, got model=%q", out["model"])
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (s == sub || len(sub) == 0 || (len(s) > 0 && (indexOf(s, sub) >= 0)))
 }

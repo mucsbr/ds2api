@@ -26,12 +26,6 @@ func (c Config) MarshalJSON() ([]byte, error) {
 	if len(c.Proxies) > 0 {
 		m["proxies"] = c.Proxies
 	}
-	if len(c.ClaudeMapping) > 0 {
-		m["claude_mapping"] = c.ClaudeMapping
-	}
-	if len(c.ClaudeModelMap) > 0 {
-		m["claude_model_mapping"] = c.ClaudeModelMap
-	}
 	if len(c.ModelAliases) > 0 {
 		m["model_aliases"] = c.ModelAliases
 	}
@@ -88,13 +82,8 @@ func (c *Config) UnmarshalJSON(b []byte) error {
 				return fmt.Errorf("invalid field %q: %w", k, err)
 			}
 		case "claude_mapping":
-			if err := json.Unmarshal(v, &c.ClaudeMapping); err != nil {
-				return fmt.Errorf("invalid field %q: %w", k, err)
-			}
 		case "claude_model_mapping":
-			if err := json.Unmarshal(v, &c.ClaudeModelMap); err != nil {
-				return fmt.Errorf("invalid field %q: %w", k, err)
-			}
+			// Removed legacy mapping fields are ignored instead of persisted.
 		case "model_aliases":
 			if err := json.Unmarshal(v, &c.ModelAliases); err != nil {
 				return fmt.Errorf("invalid field %q: %w", k, err)
@@ -150,15 +139,13 @@ func (c *Config) UnmarshalJSON(b []byte) error {
 
 func (c Config) Clone() Config {
 	clone := Config{
-		Keys:           slices.Clone(c.Keys),
-		APIKeys:        slices.Clone(c.APIKeys),
-		Accounts:       slices.Clone(c.Accounts),
-		Proxies:        slices.Clone(c.Proxies),
-		ClaudeMapping:  cloneStringMap(c.ClaudeMapping),
-		ClaudeModelMap: cloneStringMap(c.ClaudeModelMap),
-		ModelAliases:   cloneStringMap(c.ModelAliases),
-		Admin:          c.Admin,
-		Runtime:        c.Runtime,
+		Keys:         slices.Clone(c.Keys),
+		APIKeys:      slices.Clone(c.APIKeys),
+		Accounts:     slices.Clone(c.Accounts),
+		Proxies:      slices.Clone(c.Proxies),
+		ModelAliases: cloneStringMap(c.ModelAliases),
+		Admin:        c.Admin,
+		Runtime:      c.Runtime,
 		Compat: CompatConfig{
 			WideInputStrictOutput: cloneBoolPtr(c.Compat.WideInputStrictOutput),
 			StripReferenceMarkers: cloneBoolPtr(c.Compat.StripReferenceMarkers),

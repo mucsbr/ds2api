@@ -18,7 +18,6 @@ const DEFAULT_FORM = {
     embeddings: { provider: '' },
     auto_delete: { mode: 'none' },
     history_split: { enabled: true, trigger_after_turns: 1 },
-    claude_mapping_text: '{\n  "fast": "deepseek-chat",\n  "slow": "deepseek-reasoner"\n}',
     model_aliases_text: '{}',
 }
 
@@ -72,10 +71,9 @@ function fromServerForm(data) {
             mode: normalizeAutoDeleteMode(data.auto_delete),
         },
         history_split: {
-            enabled: data.history_split?.enabled ?? true,
+            enabled: true,
             trigger_after_turns: Number(data.history_split?.trigger_after_turns || 1),
         },
-        claude_mapping_text: JSON.stringify(data.claude_mapping || {}, null, 2),
         model_aliases_text: JSON.stringify(data.model_aliases || {}, null, 2),
     }
 }
@@ -96,7 +94,7 @@ function toServerPayload(form) {
         embeddings: { provider: String(form.embeddings.provider || '').trim() },
         auto_delete: { mode: normalizeAutoDeleteMode(form.auto_delete) },
         history_split: {
-            enabled: Boolean(form.history_split?.enabled ?? true),
+            enabled: true,
             trigger_after_turns: Number(form.history_split?.trigger_after_turns || 1),
         },
     }
@@ -176,10 +174,8 @@ export function useSettingsForm({ apiFetch, t, onMessage, onRefresh, onForceLogo
     }, [loadSettings])
 
     const saveSettings = useCallback(async () => {
-        let claudeMapping = {}
         let modelAliases = {}
         try {
-            claudeMapping = parseJSONMap(form.claude_mapping_text, 'claude_mapping', t)
             modelAliases = parseJSONMap(form.model_aliases_text, 'model_aliases', t)
         } catch (e) {
             onMessage('error', e.message)
@@ -188,7 +184,6 @@ export function useSettingsForm({ apiFetch, t, onMessage, onRefresh, onForceLogo
 
         const payload = {
             ...toServerPayload(form),
-            claude_mapping: claudeMapping,
             model_aliases: modelAliases,
         }
 

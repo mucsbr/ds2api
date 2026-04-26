@@ -8,7 +8,7 @@ const {
   stripFencedCodeBlocks,
 } = require('./parse_payload');
 
-const TOOL_MARKUP_PREFIXES = ['<tool_call', '<function_call', '<invoke'];
+const TOOL_MARKUP_PREFIXES = ['<tool_calls'];
 
 function extractToolNames(tools) {
   if (!Array.isArray(tools) || tools.length === 0) {
@@ -45,7 +45,6 @@ function parseToolCallsDetailed(text, toolNames) {
   if (shouldSkipToolCallParsingForCodeFenceExample(normalized)) {
     return result;
   }
-
   // XML markup parsing only.
   const parsed = parseMarkupToolCalls(normalized);
   if (parsed.length === 0) {
@@ -73,7 +72,6 @@ function parseStandaloneToolCallsDetailed(text, toolNames) {
   if (shouldSkipToolCallParsingForCodeFenceExample(trimmed)) {
     return result;
   }
-
   // XML markup parsing only.
   const parsed = parseMarkupToolCalls(trimmed);
   if (parsed.length === 0) {

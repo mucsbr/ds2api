@@ -31,13 +31,13 @@
 | Base URL | `http://localhost:5001` 或你的部署域名 |
 | 默认 Content-Type | `application/json` |
 | 健康检查 | `GET /healthz`、`GET /readyz` |
-| CORS | 已启用（`Access-Control-Allow-Origin: *`，允许 `Content-Type`, `Authorization`, `X-API-Key`, `X-Ds2-Target-Account`, `X-Ds2-Source`, `X-Vercel-Protection-Bypass`） |
+| CORS | 已启用（统一覆盖 `/v1/*`、`/anthropic/*`、`/v1beta/models/*`、`/admin/*`；浏览器有 `Origin` 时回显该 Origin，否则为 `*`；默认允许 `Content-Type`, `Authorization`, `X-API-Key`, `X-Ds2-Target-Account`, `X-Ds2-Source`, `X-Vercel-Protection-Bypass`, `X-Goog-Api-Key`, `Anthropic-Version`, `Anthropic-Beta`，并会放行预检里声明的第三方请求头，如 `x-stainless-*`；Vercel 上 `/v1/chat/completions` 的 Node Runtime 也对齐相同行为；内部专用头 `X-Ds2-Internal-Token` 仍被拦截） |
 
 ### 3.0 接口适配层说明
 
 - OpenAI / Claude / Gemini 三套协议已统一挂在同一 `chi` 路由树上，由 `internal/server/router.go` 负责装配。
 - 适配器层职责收敛为：**请求归一化 → DeepSeek 调用 → 协议形态渲染**，减少历史版本中“同能力多处实现”的分叉。
-- Tool Calling 的解析策略在 Go 与 Node Runtime 间保持一致：当前以 XML/Markup 家族解析为主（含 `<tool_call>` / `<function_call>` / `<invoke>` / `tool_use` / antml 变体），并在流式场景执行防泄漏筛分。
+- Tool Calling 的解析策略在 Go 与 Node Runtime 间保持一致：当前唯一可执行的模型输出语法是 canonical XML 工具块 `<tool_calls>` → `<invoke name="...">` → `<parameter name="...">`，并在流式场景执行防泄漏筛分。
 - `Admin API` 将配置与运行时策略分开：`/admin/config*` 管静态配置，`/admin/settings*` 管运行时行为。
 
 ---
@@ -160,6 +160,7 @@ Gemini 兼容客户端还可以使用 `x-goog-api-key`、`?key=` 或 `?api_key=`
 | DELETE | `/admin/dev/captures` | Admin | 清空本地抓包记录 |
 | GET | `/admin/chat-history` | Admin | 查看服务器端对话记录 |
 | DELETE | `/admin/chat-history` | Admin | 清空服务器端对话记录 |
+| GET | `/admin/chat-history/{id}` | Admin | 查看单条服务器端对话记录 |
 | DELETE | `/admin/chat-history/{id}` | Admin | 删除单条服务器端对话记录 |
 | PUT | `/admin/chat-history/settings` | Admin | 更新对话记录保留条数 |
 | GET | `/admin/version` | Admin | 查询当前版本与最新 Release |
@@ -194,18 +195,12 @@ Gemini 兼容客户端还可以使用 `x-goog-api-key`、`?key=` 或 `?api_key=`
 {
   "object": "list",
   "data": [
-    {"id": "deepseek-chat", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
-    {"id": "deepseek-reasoner", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
-    {"id": "deepseek-chat-search", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
-    {"id": "deepseek-reasoner-search", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
-    {"id": "deepseek-expert-chat", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
-    {"id": "deepseek-expert-reasoner", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
-    {"id": "deepseek-expert-chat-search", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
-    {"id": "deepseek-expert-reasoner-search", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
-    {"id": "deepseek-vision-chat", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
-    {"id": "deepseek-vision-reasoner", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
-    {"id": "deepseek-vision-chat-search", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
-    {"id": "deepseek-vision-reasoner-search", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []}
+    {"id": "deepseek-v4-flash", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
+    {"id": "deepseek-v4-pro", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
+    {"id": "deepseek-v4-flash-search", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
+    {"id": "deepseek-v4-pro-search", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
+    {"id": "deepseek-v4-vision", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []},
+    {"id": "deepseek-v4-vision-search", "object": "model", "created": 1677610602, "owned_by": "deepseek", "permission": []}
   ]
 }
 ```
@@ -221,12 +216,15 @@ Gemini 兼容客户端还可以使用 `x-goog-api-key`、`?key=` 或 `?api_key=`
 3. 未命中时按模型家族规则回退（如 `o*`、`gpt-*`、`claude-*`）。
 4. 仍未命中则返回 `invalid_request_error`。
 
-当前内置默认 alias（节选）：
+当前内置默认 alias 来自 `internal/config/models.go`，`config.model_aliases` 会在运行时覆盖或补充同名映射。节选：
 
-- OpenAI：`gpt-4o`、`gpt-4.1`、`gpt-4.1-mini`、`gpt-4.1-nano`、`gpt-5`、`gpt-5-mini`、`gpt-5-codex`
-- OpenAI Reasoning：`o1`、`o1-mini`、`o3`、`o3-mini`
-- Claude：`claude-sonnet-4-5`、`claude-haiku-4-5`、`claude-opus-4-6`（及 `claude-3-5-sonnet` / `claude-3-5-haiku` / `claude-3-opus` 兼容别名）
-- Gemini：`gemini-2.5-pro`、`gemini-2.5-flash`
+- OpenAI / Codex：`gpt-4o`、`gpt-4.1`、`gpt-5`、`gpt-5.5`、`gpt-5-codex`、`gpt-5.3-codex`、`codex-mini-latest`
+- OpenAI reasoning：`o1`、`o3`、`o3-deep-research`、`o4-mini`
+- Claude：`claude-opus-4-6`、`claude-sonnet-4-6`、`claude-haiku-4-5`、`claude-3-5-sonnet-latest`
+- Gemini：`gemini-2.5-pro`、`gemini-2.5-flash`、`gemini-pro-vision`
+- 其他兼容族：`llama-*`、`qwen-*`、`mistral-*`、`command-*` 会按家族启发式回退
+
+退役历史模型（如 `claude-1.*`、`claude-2.*`、`claude-instant-*`、`gpt-3.5*`）会被显式拒绝。
 
 ### `POST /v1/chat/completions`
 
@@ -241,7 +239,7 @@ Content-Type: application/json
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `model` | string | ✅ | 支持 DeepSeek 原生模型 + 常见 alias（如 `gpt-5`、`gpt-5-mini`、`gpt-5-codex`、`o3`、`claude-opus-4-6`、`gemini-2.5-pro`、`gemini-2.5-flash` 等） |
+| `model` | string | ✅ | 支持 DeepSeek 原生模型 + 常见 alias（如 `gpt-5.5`、`gpt-5.4-mini`、`gpt-5.3-codex`、`o3`、`claude-opus-4-6`、`claude-sonnet-4-6`、`gemini-2.5-pro`、`gemini-2.5-flash` 等） |
 | `messages` | array | ✅ | OpenAI 风格消息数组 |
 | `stream` | boolean | ❌ | 默认 `false` |
 | `tools` | array | ❌ | Function Calling 定义 |
@@ -254,14 +252,14 @@ Content-Type: application/json
   "id": "<chat_session_id>",
   "object": "chat.completion",
   "created": 1738400000,
-  "model": "deepseek-reasoner",
+  "model": "deepseek-v4-pro",
   "choices": [
     {
       "index": 0,
       "message": {
         "role": "assistant",
         "content": "最终回复",
-        "reasoning_content": "思考内容（reasoner 模型）"
+        "reasoning_content": "思考内容（开启 thinking 时）"
       },
       "finish_reason": "stop"
     }
@@ -296,7 +294,7 @@ data: [DONE]
 **字段说明**：
 
 - 首个 delta 包含 `role: assistant`
-- `deepseek-reasoner` / `deepseek-reasoner-search` 模型输出 `delta.reasoning_content`
+- 开启 thinking 时会输出 `delta.reasoning_content`
 - 普通文本输出 `delta.content`
 - 最后一段包含 `finish_reason` 和 `usage`
 - token 计数优先透传上游 DeepSeek SSE（如 `accumulated_token_usage` / `token_usage`）；仅在上游缺失时回退本地估算
@@ -337,7 +335,7 @@ data: [DONE]
 补充说明：
 
 - **非代码块上下文**下，工具负载即使与普通文本混合，也会按特征识别并产出可执行 tool call（前后普通文本仍可透传）。
-- 解析器当前走 XML/Markup 家族（包含 `<tool_call>`、`<function_call>`、`<invoke>`、`tool_use`、antml 风格）；纯 JSON `tool_calls` 片段默认不会直接作为可执行调用解析。
+- 解析器当前只把 canonical XML 工具块（`<tool_calls>` / `<invoke name="...">` / `<parameter name="...">`）作为可执行调用解析；旧式 `<tools>`、`<tool_call>`、`<tool_name>`、`<param>`、`<function_call>`、`tool_use`、antml 风格与纯 JSON `tool_calls` 片段默认都会按普通文本处理。
 - Markdown fenced code block（例如 ```json ... ```）中的 `tool_calls` 仅视为示例文本，不会被执行。
 
 ---
@@ -449,17 +447,17 @@ data: [DONE]
 {
   "object": "list",
   "data": [
-    {"id": "claude-sonnet-4-5", "object": "model", "created": 1715635200, "owned_by": "anthropic"},
+    {"id": "claude-sonnet-4-6", "object": "model", "created": 1715635200, "owned_by": "anthropic"},
     {"id": "claude-haiku-4-5", "object": "model", "created": 1715635200, "owned_by": "anthropic"},
     {"id": "claude-opus-4-6", "object": "model", "created": 1715635200, "owned_by": "anthropic"}
   ],
   "first_id": "claude-opus-4-6",
-  "last_id": "claude-instant-1.0",
+  "last_id": "claude-3-haiku-20240307",
   "has_more": false
 }
 ```
 
-> 说明：示例仅展示部分模型；实际返回除当前主别名外，还包含 Claude 4.x snapshots，以及 3.x / 2.x / 1.x 历史模型 ID 与常见别名。
+> 说明：示例仅展示部分模型；实际返回除当前主别名外，还包含 Claude 4.x snapshots，以及 3.x 历史模型 ID 与常见别名。
 
 ### `POST /anthropic/v1/messages`
 
@@ -477,7 +475,7 @@ anthropic-version: 2023-06-01
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `model` | string | ✅ | 例如 `claude-sonnet-4-5` / `claude-opus-4-6` / `claude-haiku-4-5`（兼容 `claude-3-5-haiku-latest`），并支持历史 Claude 模型 ID |
+| `model` | string | ✅ | 例如 `claude-sonnet-4-6` / `claude-opus-4-6` / `claude-haiku-4-5`（兼容 `claude-sonnet-4-5`、`claude-3-5-haiku-latest`），并支持历史 Claude 模型 ID |
 | `messages` | array | ✅ | Claude 风格消息数组 |
 | `max_tokens` | number | ❌ | 缺省自动补 `8192`；当前实现不会硬性截断上游输出 |
 | `stream` | boolean | ❌ | 默认 `false` |
@@ -491,7 +489,7 @@ anthropic-version: 2023-06-01
   "id": "msg_1738400000000000000",
   "type": "message",
   "role": "assistant",
-  "model": "claude-sonnet-4-5",
+  "model": "claude-sonnet-4-6",
   "content": [
     {"type": "text", "text": "回复内容"}
   ],
@@ -545,7 +543,7 @@ data: {"type":"message_stop"}
 
 ```json
 {
-  "model": "claude-sonnet-4-5",
+  "model": "claude-sonnet-4-6",
   "messages": [
     {"role": "user", "content": "你好"}
   ]
@@ -673,16 +671,16 @@ data: {"type":"message_stop"}
       "token_preview": "abcde..."
     }
   ],
-  "claude_mapping": {
-    "fast": "deepseek-chat",
-    "slow": "deepseek-reasoner"
+  "model_aliases": {
+    "claude-sonnet-4-6": "deepseek-v4-flash",
+    "claude-opus-4-6": "deepseek-v4-pro"
   }
 }
 ```
 
 ### `POST /admin/config`
 
-只更新 `keys`、`api_keys`、`accounts`、`claude_mapping`。
+只更新 `keys`、`api_keys`、`accounts`、`model_aliases`。
 如果同时发送 `api_keys` 与 `keys`，优先保留 `api_keys` 中的结构化 `name` / `remark`；`keys` 仅作为旧格式兼容回退。
 
 **请求**：
@@ -697,9 +695,9 @@ data: {"type":"message_stop"}
   "accounts": [
     {"email": "user@example.com", "password": "pwd", "token": ""}
   ],
-  "claude_mapping": {
-    "fast": "deepseek-chat",
-    "slow": "deepseek-reasoner"
+  "model_aliases": {
+    "claude-sonnet-4-6": "deepseek-v4-flash",
+    "claude-opus-4-6": "deepseek-v4-pro"
   }
 }
 ```
@@ -714,7 +712,8 @@ data: {"type":"message_stop"}
 - `compat`（`wide_input_strict_output`、`strip_reference_markers`）
 - `responses` / `embeddings`
 - `auto_delete`（`mode`：`none` / `single` / `all`；旧配置 `sessions=true` 仍按 `all` 处理）
-- `claude_mapping` / `model_aliases`
+- `history_split`（`enabled` 固定返回 `true`、`trigger_after_turns`）
+- `model_aliases`
 - `env_backed`、`needs_vercel_sync`
 - `toolcall` 策略已固定为 `feature_match + high`，不再通过 settings 返回或修改
 
@@ -728,7 +727,7 @@ data: {"type":"message_stop"}
 - `responses.store_ttl_seconds`
 - `embeddings.provider`
 - `auto_delete.mode`
-- `claude_mapping`
+- `history_split.trigger_after_turns`（`history_split.enabled` 已全局强制开启；旧客户端传入时会被保存为 `true`）
 - `model_aliases`
 - `toolcall` 策略已固定，不再作为可写入字段
 
@@ -753,9 +752,9 @@ data: {"type":"message_stop"}
 
 请求可直接传配置对象，或使用 `{"config": {...}, "mode":"merge"}` 包裹格式。
 也支持在查询参数里传 `?mode=merge` / `?mode=replace`。
-导入时会接受 `keys`、`api_keys`、`accounts`、`claude_mapping` / `claude_model_mapping`、`model_aliases`、`admin`、`runtime`、`responses`、`embeddings`、`auto_delete` 等字段；`toolcall` 相关字段会被忽略。
+`replace` 模式会按完整配置结构替换（保留 Vercel 同步元信息）；`merge` 模式会合并 `keys`、`api_keys`、`accounts`、`model_aliases`，并覆盖 `admin`、`runtime`、`responses`、`embeddings` 中的非空字段。`compat`、`auto_delete`、`history_split` 建议通过 `/admin/settings` 或配置文件管理；`toolcall` 相关字段会被忽略。
 
-> `compat` 相关字段请通过 `/admin/settings` 或配置文件管理；该导入接口不会更新 `compat`。
+> 注意：`merge` 模式不会更新 `compat`、`auto_delete`、`history_split`。
 
 ### `GET /admin/config/export`
 
@@ -907,7 +906,7 @@ data: {"type":"message_stop"}
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `identifier` | ✅ | email / mobile / token-only 合成标识 |
-| `model` | ❌ | 默认 `deepseek-chat` |
+| `model` | ❌ | 默认 `deepseek-v4-flash` |
 | `message` | ❌ | 空字符串时仅测试会话创建 |
 
 **响应**：
@@ -918,7 +917,7 @@ data: {"type":"message_stop"}
   "success": true,
   "response_time": 1240,
   "message": "API 测试成功（仅会话创建）",
-  "model": "deepseek-chat",
+  "model": "deepseek-v4-flash",
   "session_count": 0,
   "config_writable": true
 }
@@ -988,7 +987,7 @@ data: {"type":"message_stop"}
 
 | 字段 | 必填 | 默认值 |
 | --- | --- | --- |
-| `model` | ❌ | `deepseek-chat` |
+| `model` | ❌ | `deepseek-v4-flash` |
 | `message` | ❌ | `你好` |
 | `api_key` | ❌ | 配置中第一个 key |
 
@@ -1012,7 +1011,7 @@ data: {"type":"message_stop"}
 | --- | --- | --- | --- |
 | `message` | 否 | `你好` | 便捷单轮用户消息 |
 | `messages` | 否 | 自动由 `message` 生成 | OpenAI 风格消息数组 |
-| `model` | 否 | `deepseek-chat` | 目标模型 |
+| `model` | 否 | `deepseek-v4-flash` | 目标模型 |
 | `stream` | 否 | `true` | 建议保留流式，以记录原始 SSE |
 | `api_key` | 否 | 配置中第一个 key | 调用业务接口使用的 key |
 | `sample_id` | 否 | 自动生成 | 样本目录名 |
@@ -1222,7 +1221,7 @@ curl http://localhost:5001/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-chat",
+    "model": "deepseek-v4-flash",
     "messages": [{"role": "user", "content": "你好"}],
     "stream": false
   }'
@@ -1235,7 +1234,7 @@ curl http://localhost:5001/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-reasoner",
+    "model": "deepseek-v4-pro",
     "messages": [{"role": "user", "content": "解释一下量子纠缠"}],
     "stream": true
   }'
@@ -1248,7 +1247,7 @@ curl http://localhost:5001/v1/responses \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5-codex",
+    "model": "gpt-5.3-codex",
     "input": "写一个 golang 的 hello world",
     "stream": true
   }'
@@ -1273,7 +1272,7 @@ curl http://localhost:5001/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-chat-search",
+    "model": "deepseek-v4-flash-search",
     "messages": [{"role": "user", "content": "今天的新闻"}],
     "stream": true
   }'
@@ -1286,7 +1285,7 @@ curl http://localhost:5001/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-chat",
+    "model": "deepseek-v4-flash",
     "messages": [{"role": "user", "content": "北京今天天气怎么样？"}],
     "tools": [
       {
@@ -1347,7 +1346,7 @@ curl http://localhost:5001/anthropic/v1/messages \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
-    "model": "claude-sonnet-4-5",
+    "model": "claude-sonnet-4-6",
     "max_tokens": 1024,
     "messages": [{"role": "user", "content": "你好"}]
   }'
@@ -1384,7 +1383,7 @@ curl http://localhost:5001/v1/chat/completions \
   -H "X-Ds2-Target-Account: user@example.com" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-chat",
+    "model": "deepseek-v4-flash",
     "messages": [{"role": "user", "content": "你好"}]
   }'
 ```

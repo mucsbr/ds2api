@@ -20,6 +20,25 @@ Node 单元测试脚本会先做 `node --check` 语法门禁，再以 `--test-co
 
 ---
 
+## PR 门禁 | PR Gates
+
+打开或更新 PR 前，按 `.github/workflows/quality-gates.yml` 的同等本地门禁执行：
+
+```bash
+./scripts/lint.sh
+./tests/scripts/check-refactor-line-gate.sh
+./tests/scripts/run-unit-all.sh
+npm run build --prefix webui
+```
+
+说明：
+
+- `./scripts/lint.sh` 会运行 Go 格式化检查和 `golangci-lint`；修改 Go 文件后仍建议先执行 `gofmt -w <files>`。
+- `run-unit-all.sh` 串行调用 Go 与 Node 单元测试入口。
+- `run-live.sh` 是真实账号端到端测试，适合作为发布或高风险改动后的补充验证，不属于每次 PR 的固定本地门禁。
+
+---
+
 ## 快速开始 | Quick Start
 
 ### 单元测试 | Unit Tests
@@ -39,7 +58,7 @@ Node 单元测试脚本会先做 `node --check` 语法门禁，再以 `--test-co
 ./tests/scripts/check-refactor-line-gate.sh
 ./tests/scripts/check-node-split-syntax.sh
 
-# 发布阻断：阶段 6 手工烟测签字检查（默认读取 plans/stage6-manual-smoke.md）
+# 历史阶段门禁：阶段 6 手工烟测签字检查（默认读取 plans/stage6-manual-smoke.md）
 ./tests/scripts/check-stage6-manual-smoke.sh
 ```
 
@@ -190,8 +209,8 @@ go test -v -run TestParseToolCallsWithDeepSeekHallucination ./internal/toolcall/
 # 运行 format 相关测试
 go test -v ./internal/format/...
 
-# 运行 adapter 相关测试
-go test -v ./internal/adapter/openai/...
+# 运行 HTTP API 相关测试
+go test -v ./internal/httpapi/openai/...
 ```
 
 ### 调试 Tool Call 问题 | Debugging Tool Call Issues

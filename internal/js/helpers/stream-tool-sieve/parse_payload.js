@@ -1,30 +1,8 @@
 'use strict';
 
-const TOOL_CALL_MARKUP_BLOCK_PATTERN = /<(?:[a-z0-9_:-]+:)?(tool_call|function_call|invoke)\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1>/gi;
-const TOOL_CALL_MARKUP_WRAPPER_PATTERNS = [
-  /<(?:[a-z0-9_:-]+:)?tool_calls\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?tool_calls>/gi,
-  /<(?:[a-z0-9_:-]+:)?function_calls\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function_calls>/gi,
-];
-const TOOL_CALL_MARKUP_SELFCLOSE_PATTERN = /<(?:[a-z0-9_:-]+:)?invoke\b([^>]*)\/>/gi;
 const TOOL_CALL_MARKUP_KV_PATTERN = /<(?:[a-z0-9_:-]+:)?([a-z0-9_.-]+)\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?\1>/gi;
-const TOOL_CALL_MARKUP_ATTR_PATTERN = /(name|function|tool)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i;
-const TOOL_CALL_MARKUP_NAME_PATTERNS = [
-  /<(?:[a-z0-9_:-]+:)?tool_name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?tool_name>/i,
-  /<(?:[a-z0-9_:-]+:)?function_name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function_name>/i,
-  /<(?:[a-z0-9_:-]+:)?name\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?name>/i,
-  /<(?:[a-z0-9_:-]+:)?function\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?function>/i,
-];
-const TOOL_CALL_MARKUP_ARGS_PATTERNS = [
-  /<(?:[a-z0-9_:-]+:)?input\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?input>/i,
-  /<(?:[a-z0-9_:-]+:)?arguments\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?arguments>/i,
-  /<(?:[a-z0-9_:-]+:)?argument\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?argument>/i,
-  /<(?:[a-z0-9_:-]+:)?parameters\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?parameters>/i,
-  /<(?:[a-z0-9_:-]+:)?parameter\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?parameter>/i,
-  /<(?:[a-z0-9_:-]+:)?args\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?args>/i,
-  /<(?:[a-z0-9_:-]+:)?params\b[^>]*>([\s\S]*?)<\/(?:[a-z0-9_:-]+:)?params>/i,
-];
 const CDATA_PATTERN = /^<!\[CDATA\[([\s\S]*?)]]>$/i;
-const HTML_ENTITIES_PATTERN = /&[a-z0-9#]+;/gi;
+const XML_ATTR_PATTERN = /\b([a-z0-9_:-]+)\s*=\s*("([^"]*)"|'([^']*)')/gi;
 
 const {
   toStringSafe,
@@ -44,62 +22,204 @@ function parseMarkupToolCalls(text) {
     return [];
   }
   const out = [];
-  for (const m of raw.matchAll(TOOL_CALL_MARKUP_BLOCK_PATTERN)) {
-    const parsed = parseMarkupSingleToolCall(toStringSafe(m[2]).trim(), toStringSafe(m[3]).trim());
-    if (parsed) {
-      out.push(parsed);
+  for (const wrapper of findXmlElementBlocks(raw, 'tool_calls')) {
+    const body = toStringSafe(wrapper.body);
+    for (const block of findXmlElementBlocks(body, 'invoke')) {
+      const parsed = parseMarkupSingleToolCall(block);
+      if (parsed) {
+        out.push(parsed);
+      }
     }
-  }
-  for (const m of raw.matchAll(TOOL_CALL_MARKUP_SELFCLOSE_PATTERN)) {
-    const parsed = parseMarkupSingleToolCall(toStringSafe(m[1]).trim(), '');
-    if (parsed) {
-      out.push(parsed);
-    }
-  }
-  if (out.length === 0) {
-    return parseWrapperNamedTagToolCalls(raw);
   }
   return out;
 }
 
-function parseMarkupSingleToolCall(attrs, inner) {
-  // Try inline JSON parse for the inner content.
+function parseMarkupSingleToolCall(block) {
+  const attrs = parseTagAttributes(block.attrs);
+  const name = toStringSafe(attrs.name).trim();
+  if (!name) {
+    return null;
+  }
+  const inner = toStringSafe(block.body).trim();
+
   if (inner) {
     try {
       const decoded = JSON.parse(inner);
-      if (decoded && typeof decoded === 'object' && !Array.isArray(decoded) && decoded.name) {
+      if (decoded && typeof decoded === 'object' && !Array.isArray(decoded)) {
         return {
-          name: toStringSafe(decoded.name),
-          input: decoded.input && typeof decoded.input === 'object' && !Array.isArray(decoded.input) ? decoded.input : {},
+          name,
+          input: decoded.input && typeof decoded.input === 'object' && !Array.isArray(decoded.input)
+            ? decoded.input
+            : decoded.parameters && typeof decoded.parameters === 'object' && !Array.isArray(decoded.parameters)
+              ? decoded.parameters
+              : {},
         };
       }
     } catch (_err) {
       // Not JSON, continue with markup parsing.
     }
   }
-  let name = '';
-  const attrMatch = attrs.match(TOOL_CALL_MARKUP_ATTR_PATTERN);
-  if (attrMatch) {
-    name = sanitizeToolName(attrMatch[2] || attrMatch[3] || attrMatch[4] || '');
+  const input = {};
+  for (const match of findXmlElementBlocks(inner, 'parameter')) {
+    const parameterAttrs = parseTagAttributes(match.attrs);
+    const paramName = toStringSafe(parameterAttrs.name).trim();
+    if (!paramName) {
+      continue;
+    }
+    appendMarkupValue(input, paramName, parseMarkupValue(match.body));
   }
-  if (!name) {
-    name = sanitizeToolName(extractRawTagValue(findMarkupTagValue(inner, TOOL_CALL_MARKUP_NAME_PATTERNS)));
-  }
-  if (!name) {
+  if (Object.keys(input).length === 0 && inner.trim() !== '') {
     return null;
   }
+  return { name, input };
+}
 
-  let input = {};
-  const argsRaw = findMarkupTagValue(inner, TOOL_CALL_MARKUP_ARGS_PATTERNS);
-  if (argsRaw) {
-    input = parseMarkupInput(argsRaw);
-  } else {
-    const kv = parseMarkupKVObject(inner);
-    if (Object.keys(kv).length > 0) {
-      input = kv;
+function findXmlElementBlocks(text, tag) {
+  const source = toStringSafe(text);
+  const name = toStringSafe(tag).toLowerCase();
+  if (!source || !name) {
+    return [];
+  }
+  const out = [];
+  let pos = 0;
+  while (pos < source.length) {
+    const start = findXmlStartTagOutsideCDATA(source, name, pos);
+    if (!start) {
+      break;
+    }
+    const end = findMatchingXmlEndTagOutsideCDATA(source, name, start.bodyStart);
+    if (!end) {
+      break;
+    }
+    out.push({
+      attrs: start.attrs,
+      body: source.slice(start.bodyStart, end.closeStart),
+      start: start.start,
+      end: end.closeEnd,
+    });
+    pos = end.closeEnd;
+  }
+  return out;
+}
+
+function findXmlStartTagOutsideCDATA(text, tag, from) {
+  const lower = text.toLowerCase();
+  const target = `<${tag}`;
+  for (let i = Math.max(0, from || 0); i < text.length;) {
+    const skipped = skipXmlIgnoredSection(lower, i);
+    if (skipped.blocked) {
+      return null;
+    }
+    if (skipped.advanced) {
+      i = skipped.next;
+      continue;
+    }
+    if (lower.startsWith(target, i) && hasXmlTagBoundary(text, i + target.length)) {
+      const tagEnd = findXmlTagEnd(text, i + target.length);
+      if (tagEnd < 0) {
+        return null;
+      }
+      return {
+        start: i,
+        bodyStart: tagEnd + 1,
+        attrs: text.slice(i + target.length, tagEnd),
+      };
+    }
+    i += 1;
+  }
+  return null;
+}
+
+function findMatchingXmlEndTagOutsideCDATA(text, tag, from) {
+  const lower = text.toLowerCase();
+  const openTarget = `<${tag}`;
+  const closeTarget = `</${tag}`;
+  let depth = 1;
+  for (let i = Math.max(0, from || 0); i < text.length;) {
+    const skipped = skipXmlIgnoredSection(lower, i);
+    if (skipped.blocked) {
+      return null;
+    }
+    if (skipped.advanced) {
+      i = skipped.next;
+      continue;
+    }
+    if (lower.startsWith(closeTarget, i) && hasXmlTagBoundary(text, i + closeTarget.length)) {
+      const tagEnd = findXmlTagEnd(text, i + closeTarget.length);
+      if (tagEnd < 0) {
+        return null;
+      }
+      depth -= 1;
+      if (depth === 0) {
+        return { closeStart: i, closeEnd: tagEnd + 1 };
+      }
+      i = tagEnd + 1;
+      continue;
+    }
+    if (lower.startsWith(openTarget, i) && hasXmlTagBoundary(text, i + openTarget.length)) {
+      const tagEnd = findXmlTagEnd(text, i + openTarget.length);
+      if (tagEnd < 0) {
+        return null;
+      }
+      if (!isSelfClosingXmlTag(text.slice(i, tagEnd))) {
+        depth += 1;
+      }
+      i = tagEnd + 1;
+      continue;
+    }
+    i += 1;
+  }
+  return null;
+}
+
+function skipXmlIgnoredSection(lower, i) {
+  if (lower.startsWith('<![cdata[', i)) {
+    const end = lower.indexOf(']]>', i + '<![cdata['.length);
+    if (end < 0) {
+      return { advanced: false, blocked: true, next: i };
+    }
+    return { advanced: true, blocked: false, next: end + ']]>'.length };
+  }
+  if (lower.startsWith('<!--', i)) {
+    const end = lower.indexOf('-->', i + '<!--'.length);
+    if (end < 0) {
+      return { advanced: false, blocked: true, next: i };
+    }
+    return { advanced: true, blocked: false, next: end + '-->'.length };
+  }
+  return { advanced: false, blocked: false, next: i };
+}
+
+function findXmlTagEnd(text, from) {
+  let quote = '';
+  for (let i = Math.max(0, from || 0); i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === quote) {
+        quote = '';
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === '>') {
+      return i;
     }
   }
-  return { name, input };
+  return -1;
+}
+
+function hasXmlTagBoundary(text, idx) {
+  if (idx >= text.length) {
+    return true;
+  }
+  return [' ', '\t', '\n', '\r', '>', '/'].includes(text[idx]);
+}
+
+function isSelfClosingXmlTag(startTag) {
+  return toStringSafe(startTag).trim().endsWith('/');
 }
 
 function parseMarkupInput(raw) {
@@ -145,6 +265,10 @@ function parseMarkupKVObject(text) {
 }
 
 function parseMarkupValue(raw) {
+  const cdata = extractStandaloneCDATA(raw);
+  if (cdata.ok) {
+    return cdata.value;
+  }
   const s = toStringSafe(extractRawTagValue(raw)).trim();
   if (!s) {
     return '';
@@ -160,11 +284,14 @@ function parseMarkupValue(raw) {
     }
   }
 
-  try {
-    return JSON.parse(s);
-  } catch (_err) {
-    return s;
+  if (s.startsWith('{') || s.startsWith('[')) {
+    try {
+      return JSON.parse(s);
+    } catch (_err) {
+      return s;
+    }
   }
+  return s;
 }
 
 function extractRawTagValue(inner) {
@@ -174,9 +301,9 @@ function extractRawTagValue(inner) {
   }
 
   // 1. Check for CDATA
-  const cdataMatch = s.match(CDATA_PATTERN);
-  if (cdataMatch && cdataMatch[1] !== undefined) {
-    return cdataMatch[1];
+  const cdata = extractStandaloneCDATA(s);
+  if (cdata.ok) {
+    return cdata.value;
   }
 
   // 2. Fallback to unescaping standard HTML entities
@@ -194,19 +321,29 @@ function unescapeHtml(safe) {
     .replace(/&#x27;/g, "'");
 }
 
-function stripTagText(text) {
-  return toStringSafe(text).replace(/<[^>]+>/g, ' ').trim();
+function extractStandaloneCDATA(inner) {
+  const s = toStringSafe(inner).trim();
+  const cdataMatch = s.match(CDATA_PATTERN);
+  if (cdataMatch && cdataMatch[1] !== undefined) {
+    return { ok: true, value: cdataMatch[1] };
+  }
+  return { ok: false, value: '' };
 }
 
-function findMarkupTagValue(text, patterns) {
-  const source = toStringSafe(text);
-  for (const p of patterns) {
-    const m = source.match(p);
-    if (m && m[1] !== undefined) {
-      return toStringSafe(m[1]);
-    }
+function parseTagAttributes(raw) {
+  const source = toStringSafe(raw);
+  const out = {};
+  if (!source) {
+    return out;
   }
-  return '';
+  for (const match of source.matchAll(XML_ATTR_PATTERN)) {
+    const key = toStringSafe(match[1]).trim().toLowerCase();
+    if (!key) {
+      continue;
+    }
+    out[key] = match[3] || match[4] || '';
+  }
+  return out;
 }
 
 function parseToolCallInput(v) {
@@ -253,72 +390,6 @@ function appendMarkupValue(out, key, value) {
     return;
   }
   out[key] = value;
-}
-
-function sanitizeToolName(raw) {
-  let name = toStringSafe(unescapeHtml(raw)).trim();
-  name = name.replace(/^[`'"\s]+|[`'"\s]+$/g, '');
-  while (name && !/[a-z0-9_.:-]$/i.test(name)) {
-    name = name.slice(0, -1).trim();
-  }
-  return name;
-}
-
-function parseWrapperNamedTagToolCalls(text) {
-  const raw = toStringSafe(text).trim();
-  if (!raw) {
-    return [];
-  }
-  for (const pattern of TOOL_CALL_MARKUP_WRAPPER_PATTERNS) {
-    for (const m of raw.matchAll(pattern)) {
-      const parsed = parseWrapperNamedTagSingle(toStringSafe(m[1]).trim());
-      if (parsed) {
-        return [parsed];
-      }
-    }
-  }
-  return [];
-}
-
-function parseWrapperNamedTagSingle(inner) {
-  const body = toStringSafe(inner).trim();
-  if (!body.startsWith('<')) {
-    return null;
-  }
-  const open = body.match(/^<([a-z0-9_:-]+)\b[^>]*>/i);
-  if (!open || !open[1]) {
-    return null;
-  }
-  const name = sanitizeToolName(open[1]);
-  if (!name) {
-    return null;
-  }
-  const lower = name.toLowerCase();
-  if (['tool_call', 'function_call', 'invoke', 'tool_calls', 'function_calls'].includes(lower)) {
-    return null;
-  }
-  const bodyPattern = new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)<\\/${name}>`, 'i');
-  const match = body.match(bodyPattern);
-  if (!match || match[1] === undefined) {
-    return null;
-  }
-  const content = toStringSafe(match[1]).trim();
-  let input = {};
-  const argsRaw = findMarkupTagValue(content, TOOL_CALL_MARKUP_ARGS_PATTERNS);
-  if (argsRaw) {
-    input = parseMarkupInput(argsRaw);
-  } else {
-    const kv = parseMarkupKVObject(content);
-    if (Object.keys(kv).length > 0) {
-      input = kv;
-    } else {
-      const parsed = parseToolCallInput(content);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && !isOnlyRawValue(parsed)) {
-        input = parsed;
-      }
-    }
-  }
-  return { name, input };
 }
 
 function isOnlyRawValue(obj) {

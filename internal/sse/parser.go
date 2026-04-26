@@ -6,7 +6,7 @@ import (
 	"regexp"
 	"strings"
 
-	"ds2api/internal/deepseek"
+	dsprotocol "ds2api/internal/deepseek/protocol"
 )
 
 type ContentPart struct {
@@ -34,10 +34,10 @@ func shouldSkipPath(path string) bool {
 	if isFragmentStatusPath(path) {
 		return true
 	}
-	if _, ok := deepseek.SkipExactPathSet[path]; ok {
+	if _, ok := dsprotocol.SkipExactPathSet[path]; ok {
 		return true
 	}
-	for _, p := range deepseek.SkipContainsPatterns {
+	for _, p := range dsprotocol.SkipContainsPatterns {
 		if strings.Contains(path, p) {
 			return true
 		}
@@ -97,6 +97,10 @@ func ParseSSEChunkForContent(chunk map[string]any, thinkingEnabled bool, current
 	var transitioned bool
 	parts, transitioned = splitThinkingParts(parts)
 	if transitioned {
+		newType = "text"
+	}
+	if !thinkingEnabled {
+		parts = dropThinkingParts(parts)
 		newType = "text"
 	}
 	return parts, false, newType
@@ -172,6 +176,9 @@ func updateTypeFromNestedResponse(path string, v any, newType *string) {
 func resolvePartType(path string, thinkingEnabled bool, newType string) string {
 	switch {
 	case path == "response/thinking_content":
+		if !thinkingEnabled {
+			return "thinking"
+		}
 		if newType == "text" {
 			return "text"
 		}
@@ -185,6 +192,20 @@ func resolvePartType(path string, thinkingEnabled bool, newType string) string {
 	default:
 		return "text"
 	}
+}
+
+func dropThinkingParts(parts []ContentPart) []ContentPart {
+	if len(parts) == 0 {
+		return parts
+	}
+	out := parts[:0]
+	for _, p := range parts {
+		if p.Type == "thinking" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 func appendChunkValueContent(v any, partType string, newType *string, parts *[]ContentPart, path string) bool {

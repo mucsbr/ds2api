@@ -47,9 +47,6 @@ func parseToolCallsDetailedXMLOnly(text string) ToolCallParseResult {
 
 	parsed := parseXMLToolCalls(trimmed)
 	if len(parsed) == 0 {
-		parsed = parseMarkupToolCalls(trimmed)
-	}
-	if len(parsed) == 0 {
 		return result
 	}
 
@@ -77,16 +74,7 @@ func filterToolCallsDetailed(parsed []ParsedToolCall) ([]ParsedToolCall, []strin
 
 func looksLikeToolCallSyntax(text string) bool {
 	lower := strings.ToLower(text)
-	return strings.Contains(lower, "<tool_calls") ||
-		strings.Contains(lower, "<tool_call") ||
-		strings.Contains(lower, "<function_calls") ||
-		strings.Contains(lower, "<function_call") ||
-		strings.Contains(lower, "<invoke") ||
-		strings.Contains(lower, "<tool_use") ||
-		strings.Contains(lower, "<attempt_completion") ||
-		strings.Contains(lower, "<ask_followup_question") ||
-		strings.Contains(lower, "<new_task") ||
-		strings.Contains(lower, "<result")
+	return strings.Contains(lower, "<tool_calls")
 }
 
 func stripFencedCodeBlocks(text string) string {
@@ -99,7 +87,13 @@ func stripFencedCodeBlocks(text string) string {
 	lines := strings.SplitAfter(text, "\n")
 	inFence := false
 	fenceMarker := ""
+	inCDATA := false
 	for _, line := range lines {
+		if inCDATA || cdataStartsBeforeFence(line) {
+			b.WriteString(line)
+			inCDATA = updateCDATAState(inCDATA, line)
+			continue
+		}
 		trimmed := strings.TrimLeft(line, " \t")
 		if !inFence {
 			if marker, ok := parseFenceOpen(trimmed); ok {
@@ -121,6 +115,54 @@ func stripFencedCodeBlocks(text string) string {
 		return ""
 	}
 	return b.String()
+}
+
+func cdataStartsBeforeFence(line string) bool {
+	cdataIdx := strings.Index(strings.ToLower(line), "<![cdata[")
+	if cdataIdx < 0 {
+		return false
+	}
+	fenceIdx := firstFenceMarkerIndex(line)
+	return fenceIdx < 0 || cdataIdx < fenceIdx
+}
+
+func firstFenceMarkerIndex(line string) int {
+	idxBacktick := strings.Index(line, "```")
+	idxTilde := strings.Index(line, "~~~")
+	switch {
+	case idxBacktick < 0:
+		return idxTilde
+	case idxTilde < 0:
+		return idxBacktick
+	case idxBacktick < idxTilde:
+		return idxBacktick
+	default:
+		return idxTilde
+	}
+}
+
+func updateCDATAState(inCDATA bool, line string) bool {
+	lower := strings.ToLower(line)
+	pos := 0
+	state := inCDATA
+	for pos < len(lower) {
+		if state {
+			end := strings.Index(lower[pos:], "]]>")
+			if end < 0 {
+				return true
+			}
+			pos += end + len("]]>")
+			state = false
+			continue
+		}
+		start := strings.Index(lower[pos:], "<![cdata[")
+		if start < 0 {
+			return false
+		}
+		pos += start + len("<![cdata[")
+		state = true
+	}
+	return state
 }
 
 func parseFenceOpen(line string) (string, bool) {

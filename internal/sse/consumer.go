@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"ds2api/internal/deepseek"
+	dsprotocol "ds2api/internal/deepseek/protocol"
 )
 
 // CollectResult holds the aggregated text and thinking content from a
@@ -35,7 +35,7 @@ func CollectStream(resp *http.Response, thinkingEnabled bool, closeBody bool) Co
 	if thinkingEnabled {
 		currentType = "thinking"
 	}
-	_ = deepseek.ScanSSELines(resp, func(line []byte) bool {
+	_ = dsprotocol.ScanSSELines(resp, func(line []byte) bool {
 		chunk, done, parsed := ParseDeepSeekSSELine(line)
 		if parsed && !done {
 			collector.ingestChunk(chunk)

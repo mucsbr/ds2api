@@ -1,0 +1,597 @@
+package toolstream
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestProcessToolSieveInterceptsXMLToolCallWithoutLeak(t *testing.T) {
+	var state State
+	// Simulate a model producing XML tool call output chunk by chunk.
+	chunks := []string{
+		"<tool_calls>\n",
+		`  <invoke name="read_file">` + "\n",
+		`    <parameter name="path">README.MD</parameter>` + "\n",
+		"  </invoke>\n",
+		"</tool_calls>",
+	}
+	var events []Event
+	for _, c := range chunks {
+		events = append(events, ProcessChunk(&state, c, []string{"read_file"})...)
+	}
+	events = append(events, Flush(&state, []string{"read_file"})...)
+
+	var textContent string
+	var toolCalls int
+	for _, evt := range events {
+		if evt.Content != "" {
+			textContent += evt.Content
+		}
+		toolCalls += len(evt.ToolCalls)
+	}
+
+	if strings.Contains(textContent, "<invoke ") {
+		t.Fatalf("XML tool call content leaked to text: %q", textContent)
+	}
+	if strings.Contains(textContent, "read_file") {
+		t.Fatalf("tool name leaked to text: %q", textContent)
+	}
+	if toolCalls == 0 {
+		t.Fatal("expected tool calls to be extracted, got none")
+	}
+}
+
+func TestProcessToolSieveHandlesLongXMLToolCall(t *testing.T) {
+	var state State
+	const toolName = "write_to_file"
+	payload := strings.Repeat("x", 4096)
+	splitAt := len(payload) / 2
+	chunks := []string{
+		"<tool_calls>\n  <invoke name=\"" + toolName + "\">\n    <parameter name=\"content\"><![CDATA[",
+		payload[:splitAt],
+		payload[splitAt:],
+		"]]></parameter>\n  </invoke>\n</tool_calls>",
+	}
+
+	var events []Event
+	for _, c := range chunks {
+		events = append(events, ProcessChunk(&state, c, []string{toolName})...)
+	}
+	events = append(events, Flush(&state, []string{toolName})...)
+
+	var textContent strings.Builder
+	toolCalls := 0
+	var gotPayload any
+	for _, evt := range events {
+		if evt.Content != "" {
+			textContent.WriteString(evt.Content)
+		}
+		if len(evt.ToolCalls) > 0 && gotPayload == nil {
+			gotPayload = evt.ToolCalls[0].Input["content"]
+		}
+		toolCalls += len(evt.ToolCalls)
+	}
+
+	if toolCalls != 1 {
+		t.Fatalf("expected one long XML tool call, got %d events=%#v", toolCalls, events)
+	}
+	if textContent.Len() != 0 {
+		t.Fatalf("expected no leaked text for long XML tool call, got %q", textContent.String())
+	}
+	got, _ := gotPayload.(string)
+	if got != payload {
+		t.Fatalf("expected long XML payload to survive intact, got len=%d want=%d", len(got), len(payload))
+	}
+}
+
+func TestProcessToolSieveKeepsCDATAEmbeddedToolClosingBuffered(t *testing.T) {
+	var state State
+	payload := strings.Join([]string{
+		"# DS2API 4.0 更新内容",
+		"",
+		strings.Repeat("x", 4096),
+		"```xml",
+		"<tool_calls>",
+		"  <invoke name=\"demo\">",
+		"    <parameter name=\"value\">x</parameter>",
+		"  </invoke>",
+		"</tool_calls>",
+		"```",
+		"tail",
+	}, "\n")
+	innerClose := strings.Index(payload, "</tool_calls>") + len("</tool_calls>")
+	chunks := []string{
+		"<tool_calls>\n  <invoke name=\"Write\">\n    <parameter name=\"content\"><![CDATA[",
+		payload[:innerClose],
+		payload[innerClose:],
+		"]]></parameter>\n    <parameter name=\"file_path\">DS2API-4.0-Release-Notes.md</parameter>\n  </invoke>\n</tool_calls>",
+	}
+
+	var events []Event
+	for i, c := range chunks {
+		next := ProcessChunk(&state, c, []string{"Write"})
+		if i <= 1 {
+			for _, evt := range next {
+				if evt.Content != "" || len(evt.ToolCalls) > 0 {
+					t.Fatalf("expected no events before outer closing tag, chunk=%d events=%#v", i, next)
+				}
+			}
+		}
+		events = append(events, next...)
+	}
+	events = append(events, Flush(&state, []string{"Write"})...)
+
+	var textContent strings.Builder
+	var gotPayload string
+	toolCalls := 0
+	for _, evt := range events {
+		textContent.WriteString(evt.Content)
+		if len(evt.ToolCalls) > 0 {
+			toolCalls += len(evt.ToolCalls)
+			gotPayload, _ = evt.ToolCalls[0].Input["content"].(string)
+		}
+	}
+
+	if toolCalls != 1 {
+		t.Fatalf("expected one parsed tool call, got %d events=%#v", toolCalls, events)
+	}
+	if textContent.Len() != 0 {
+		t.Fatalf("expected no leaked text, got %q", textContent.String())
+	}
+	if gotPayload != payload {
+		t.Fatalf("expected full CDATA payload to survive intact, got len=%d want=%d", len(gotPayload), len(payload))
+	}
+}
+
+func TestProcessToolSieveXMLWithLeadingText(t *testing.T) {
+	var state State
+	// Model outputs some prose then an XML tool call.
+	chunks := []string{
+		"Let me check the file.\n",
+		"<tool_calls>\n  <invoke name=\"read_file\">\n",
+		`    <parameter name="path">go.mod</parameter>` + "\n  </invoke>\n</tool_calls>",
+	}
+	var events []Event
+	for _, c := range chunks {
+		events = append(events, ProcessChunk(&state, c, []string{"read_file"})...)
+	}
+	events = append(events, Flush(&state, []string{"read_file"})...)
+
+	var textContent string
+	var toolCalls int
+	for _, evt := range events {
+		if evt.Content != "" {
+			textContent += evt.Content
+		}
+		toolCalls += len(evt.ToolCalls)
+	}
+
+	// Leading text should be emitted.
+	if !strings.Contains(textContent, "Let me check the file.") {
+		t.Fatalf("expected leading text to be emitted, got %q", textContent)
+	}
+	// The XML itself should NOT leak.
+	if strings.Contains(textContent, "<invoke ") {
+		t.Fatalf("XML tool call content leaked to text: %q", textContent)
+	}
+	if toolCalls == 0 {
+		t.Fatal("expected tool calls to be extracted, got none")
+	}
+}
+
+func TestProcessToolSievePassesThroughNonToolXMLBlock(t *testing.T) {
+	var state State
+	chunk := `<tool><title>示例 XML</title><body>plain text xml payload</body></tool>`
+	events := ProcessChunk(&state, chunk, []string{"read_file"})
+	events = append(events, Flush(&state, []string{"read_file"})...)
+
+	var textContent strings.Builder
+	toolCalls := 0
+	for _, evt := range events {
+		textContent.WriteString(evt.Content)
+		toolCalls += len(evt.ToolCalls)
+	}
+	if toolCalls != 0 {
+		t.Fatalf("expected no tool calls for plain XML payload, got %d events=%#v", toolCalls, events)
+	}
+	if textContent.String() != chunk {
+		t.Fatalf("expected XML payload to pass through unchanged, got %q", textContent.String())
+	}
+}
+
+func TestProcessToolSieveNonToolXMLKeepsSuffixForToolParsing(t *testing.T) {
+	var state State
+	chunk := `<tool><title>plain xml</title></tool><tool_calls><invoke name="read_file"><parameter name="path">README.MD</parameter></invoke></tool_calls>`
+	events := ProcessChunk(&state, chunk, []string{"read_file"})
+	events = append(events, Flush(&state, []string{"read_file"})...)
+
+	var textContent strings.Builder
+	toolCalls := 0
+	for _, evt := range events {
+		textContent.WriteString(evt.Content)
+		toolCalls += len(evt.ToolCalls)
+	}
+	if !strings.Contains(textContent.String(), `<tool><title>plain xml</title></tool>`) {
+		t.Fatalf("expected leading non-tool XML to be preserved, got %q", textContent.String())
+	}
+	if strings.Contains(textContent.String(), `<tool_calls><invoke`) {
+		t.Fatalf("expected invoke tool XML to be intercepted, got %q", textContent.String())
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected exactly one parsed tool call from suffix, got %d events=%#v", toolCalls, events)
+	}
+}
+
+func TestProcessToolSievePassesThroughMalformedExecutableXMLBlock(t *testing.T) {
+	var state State
+	chunk := `<tool_calls><invoke name="read_file"><param>{"path":"README.md"}</param></invoke></tool_calls>`
+	events := ProcessChunk(&state, chunk, []string{"read_file"})
+	events = append(events, Flush(&state, []string{"read_file"})...)
+
+	var textContent strings.Builder
+	toolCalls := 0
+	for _, evt := range events {
+		textContent.WriteString(evt.Content)
+		toolCalls += len(evt.ToolCalls)
+	}
+
+	if toolCalls != 0 {
+		t.Fatalf("expected malformed executable-looking XML to stay text, got %d events=%#v", toolCalls, events)
+	}
+	if textContent.String() != chunk {
+		t.Fatalf("expected malformed executable-looking XML to pass through unchanged, got %q", textContent.String())
+	}
+}
+
+func TestProcessToolSievePassesThroughFencedXMLToolCallExamples(t *testing.T) {
+	var state State
+	input := strings.Join([]string{
+		"Before first example.\n```",
+		"xml\n<tool_calls><invoke name=\"read_file\"><parameter name=\"path\">README.md</parameter></invoke></tool_calls>\n```\n",
+		"Between examples.\n```xml\n",
+		"<tool_calls><invoke name=\"search\"><parameter name=\"q\">golang</parameter></invoke></tool_calls>\n",
+		"```\nAfter examples.",
+	}, "")
+
+	chunks := []string{
+		"Before first example.\n```",
+		"xml\n<tool_calls><invoke name=\"read_file\"><parameter name=\"path\">README.md</parameter></invoke></tool_calls>\n```\n",
+		"Between examples.\n```xml\n",
+		"<tool_calls><invoke name=\"search\"><parameter name=\"q\">golang</parameter></invoke></tool_calls>\n",
+		"```\nAfter examples.",
+	}
+
+	var events []Event
+	for _, c := range chunks {
+		events = append(events, ProcessChunk(&state, c, []string{"read_file", "search"})...)
+	}
+	events = append(events, Flush(&state, []string{"read_file", "search"})...)
+
+	var textContent strings.Builder
+	toolCalls := 0
+	for _, evt := range events {
+		if evt.Content != "" {
+			textContent.WriteString(evt.Content)
+		}
+		toolCalls += len(evt.ToolCalls)
+	}
+
+	if toolCalls != 0 {
+		t.Fatalf("expected fenced XML examples to stay text, got %d tool calls events=%#v", toolCalls, events)
+	}
+	if textContent.String() != input {
+		t.Fatalf("expected fenced XML examples to pass through unchanged, got %q", textContent.String())
+	}
+}
+
+func TestProcessToolSieveKeepsPartialXMLTagInsideFencedExample(t *testing.T) {
+	var state State
+	input := strings.Join([]string{
+		"Example:\n```xml\n<tool_ca",
+		"lls><invoke name=\"read_file\"><parameter name=\"path\">README.md</parameter></invoke></tool_calls>\n```\n",
+		"Done.",
+	}, "")
+
+	chunks := []string{
+		"Example:\n```xml\n<tool_ca",
+		"lls><invoke name=\"read_file\"><parameter name=\"path\">README.md</parameter></invoke></tool_calls>\n```\n",
+		"Done.",
+	}
+
+	var events []Event
+	for _, c := range chunks {
+		events = append(events, ProcessChunk(&state, c, []string{"read_file"})...)
+	}
+	events = append(events, Flush(&state, []string{"read_file"})...)
+
+	var textContent strings.Builder
+	toolCalls := 0
+	for _, evt := range events {
+		if evt.Content != "" {
+			textContent.WriteString(evt.Content)
+		}
+		toolCalls += len(evt.ToolCalls)
+	}
+
+	if toolCalls != 0 {
+		t.Fatalf("expected partial fenced XML to stay text, got %d tool calls events=%#v", toolCalls, events)
+	}
+	if textContent.String() != input {
+		t.Fatalf("expected partial fenced XML to pass through unchanged, got %q", textContent.String())
+	}
+}
+
+func TestProcessToolSievePartialXMLTagHeldBack(t *testing.T) {
+	var state State
+	// Chunk ends with a partial XML tool tag.
+	events := ProcessChunk(&state, "Hello <too", []string{"read_file"})
+
+	var textContent string
+	for _, evt := range events {
+		textContent += evt.Content
+	}
+
+	// "Hello " should be emitted, but "<too" should be held back.
+	if strings.Contains(textContent, "<too") {
+		t.Fatalf("partial XML tag should not be emitted, got %q", textContent)
+	}
+	if !strings.Contains(textContent, "Hello") {
+		t.Fatalf("expected 'Hello' text to be emitted, got %q", textContent)
+	}
+}
+
+func TestFindToolSegmentStartDetectsXMLToolCalls(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  int
+	}{
+		{"tool_calls_tag", "some text <tool_calls>\n", 10},
+		{"invoke_tag_missing_wrapper", "some text <invoke name=\"read_file\">\n", 10},
+		{"bare_tool_call_text", "prefix <tool_call>\n", -1},
+		{"xml_inside_code_fence", "```xml\n<tool_calls><invoke name=\"read_file\"></invoke></tool_calls>\n```", -1},
+		{"no_xml", "just plain text", -1},
+		{"gemini_json_no_detect", `some text {"functionCall":{"name":"search"}}`, -1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := findToolSegmentStart(nil, tc.input)
+			if got != tc.want {
+				t.Fatalf("findToolSegmentStart(%q) = %d, want %d", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFindPartialXMLToolTagStart(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  int
+	}{
+		{"partial_tool_calls", "Hello <tool_ca", 6},
+		{"partial_invoke", "Hello <inv", 6},
+		{"bare_tool_call_not_held", "Hello <tool_name", -1},
+		{"partial_lt_only", "Text <", 5},
+		{"complete_tag", "Text <tool_calls>done", -1},
+		{"no_lt", "plain text", -1},
+		{"closed_lt", "a < b > c", -1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := findPartialXMLToolTagStart(tc.input)
+			if got != tc.want {
+				t.Fatalf("findPartialXMLToolTagStart(%q) = %d, want %d", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHasOpenXMLToolTag(t *testing.T) {
+	if !hasOpenXMLToolTag("<tool_calls>\n<invoke name=\"foo\">") {
+		t.Fatal("should detect open XML tool tag without closing tag")
+	}
+	if hasOpenXMLToolTag("<tool_calls>\n<invoke name=\"foo\"></invoke>\n</tool_calls>") {
+		t.Fatal("should return false when closing tag is present")
+	}
+	if hasOpenXMLToolTag("plain text without any XML") {
+		t.Fatal("should return false for plain text")
+	}
+}
+
+// Test the EXACT scenario the user reports: token-by-token streaming where
+// <tool_calls> tag arrives in small pieces.
+func TestProcessToolSieveTokenByTokenXMLNoLeak(t *testing.T) {
+	var state State
+	// Simulate DeepSeek model generating tokens one at a time.
+	chunks := []string{
+		"<",
+		"tool",
+		"_ca",
+		"lls",
+		">\n",
+		"  <in",
+		"voke",
+		` name="`,
+		"read",
+		"_file",
+		`">` + "\n",
+		"    <para",
+		`meter name="path">`,
+		"README.MD",
+		"</parameter>\n",
+		"  </invoke>\n",
+		"</",
+		"tool_calls",
+		">",
+	}
+	var events []Event
+	for _, c := range chunks {
+		events = append(events, ProcessChunk(&state, c, []string{"read_file"})...)
+	}
+	events = append(events, Flush(&state, []string{"read_file"})...)
+
+	var textContent string
+	var toolCalls int
+	for _, evt := range events {
+		if evt.Content != "" {
+			textContent += evt.Content
+		}
+		toolCalls += len(evt.ToolCalls)
+	}
+
+	if strings.Contains(textContent, "<invoke ") {
+		t.Fatalf("XML tool call content leaked to text in token-by-token mode: %q", textContent)
+	}
+	if strings.Contains(textContent, "tool_calls>") {
+		t.Fatalf("closing tag fragment leaked to text: %q", textContent)
+	}
+	if strings.Contains(textContent, "read_file") {
+		t.Fatalf("tool name leaked to text: %q", textContent)
+	}
+	if toolCalls == 0 {
+		t.Fatal("expected tool calls to be extracted, got none")
+	}
+}
+
+// Test that Flush on incomplete XML falls back to raw text.
+func TestFlushToolSieveIncompleteXMLFallsBackToText(t *testing.T) {
+	var state State
+	// XML block starts but stream ends before completion.
+	chunks := []string{
+		"<tool_calls>\n",
+		"  <invoke name=\"read_file\">\n",
+	}
+	var events []Event
+	for _, c := range chunks {
+		events = append(events, ProcessChunk(&state, c, []string{"read_file"})...)
+	}
+	// Stream ends abruptly - flush should NOT dump raw XML.
+	events = append(events, Flush(&state, []string{"read_file"})...)
+
+	var textContent string
+	for _, evt := range events {
+		if evt.Content != "" {
+			textContent += evt.Content
+		}
+	}
+
+	if textContent != strings.Join(chunks, "") {
+		t.Fatalf("expected incomplete XML to fall back to raw text, got %q", textContent)
+	}
+}
+
+// Test that the opening tag "<tool_calls>\n  " is NOT emitted as text content.
+func TestOpeningXMLTagNotLeakedAsContent(t *testing.T) {
+	var state State
+	// First chunk is the opening tag - should be held, not emitted.
+	evts1 := ProcessChunk(&state, "<tool_calls>\n  ", []string{"read_file"})
+	for _, evt := range evts1 {
+		if strings.Contains(evt.Content, "<tool_calls>") {
+			t.Fatalf("opening tag leaked on first chunk: %q", evt.Content)
+		}
+	}
+
+	// Remaining content arrives.
+	evts2 := ProcessChunk(&state, "<invoke name=\"read_file\">\n    <parameter name=\"path\">README.MD</parameter>\n  </invoke>\n</tool_calls>", []string{"read_file"})
+	evts2 = append(evts2, Flush(&state, []string{"read_file"})...)
+
+	var textContent string
+	var toolCalls int
+	allEvents := append(evts1, evts2...)
+	for _, evt := range allEvents {
+		if evt.Content != "" {
+			textContent += evt.Content
+		}
+		toolCalls += len(evt.ToolCalls)
+	}
+
+	if strings.Contains(textContent, "<invoke ") {
+		t.Fatalf("XML content leaked: %q", textContent)
+	}
+	if toolCalls == 0 {
+		t.Fatal("expected tool calls to be extracted")
+	}
+}
+
+func TestProcessToolSieveFallsBackToRawAttemptCompletion(t *testing.T) {
+	var state State
+	// Simulate an agent outputting attempt_completion XML tag.
+	// If it does not parse as a tool call, it should fall back to raw text.
+	chunks := []string{
+		"Done with task.\n",
+		"<attempt_completion>\n",
+		"  <result>Here is the answer</result>\n",
+		"</attempt_completion>",
+	}
+	var events []Event
+	for _, c := range chunks {
+		events = append(events, ProcessChunk(&state, c, []string{"attempt_completion"})...)
+	}
+	events = append(events, Flush(&state, []string{"attempt_completion"})...)
+
+	var textContent string
+	for _, evt := range events {
+		if evt.Content != "" {
+			textContent += evt.Content
+		}
+	}
+
+	if !strings.Contains(textContent, "Done with task.\n") {
+		t.Fatalf("expected leading text to be emitted, got %q", textContent)
+	}
+
+	if textContent != strings.Join(chunks, "") {
+		t.Fatalf("expected agent XML to fall back to raw text, got %q", textContent)
+	}
+}
+
+func TestProcessToolSievePassesThroughBareToolCallAsText(t *testing.T) {
+	var state State
+	chunk := `<invoke name="read_file"><parameter name="path">README.md</parameter></invoke>`
+	events := ProcessChunk(&state, chunk, []string{"read_file"})
+	events = append(events, Flush(&state, []string{"read_file"})...)
+
+	var textContent strings.Builder
+	toolCalls := 0
+	for _, evt := range events {
+		textContent.WriteString(evt.Content)
+		toolCalls += len(evt.ToolCalls)
+	}
+
+	if toolCalls != 0 {
+		t.Fatalf("expected bare invoke to remain text, got %d events=%#v", toolCalls, events)
+	}
+	if textContent.String() != chunk {
+		t.Fatalf("expected bare invoke to pass through unchanged, got %q", textContent.String())
+	}
+}
+
+func TestProcessToolSieveRepairsMissingOpeningWrapperWithoutLeakingInvokeText(t *testing.T) {
+	var state State
+	chunks := []string{
+		"<invoke name=\"read_file\">\n",
+		"  <parameter name=\"path\">README.md</parameter>\n",
+		"</invoke>\n",
+		"</tool_calls>",
+	}
+	var events []Event
+	for _, c := range chunks {
+		events = append(events, ProcessChunk(&state, c, []string{"read_file"})...)
+	}
+	events = append(events, Flush(&state, []string{"read_file"})...)
+
+	var textContent strings.Builder
+	toolCalls := 0
+	for _, evt := range events {
+		textContent.WriteString(evt.Content)
+		toolCalls += len(evt.ToolCalls)
+	}
+
+	if toolCalls != 1 {
+		t.Fatalf("expected repaired missing-wrapper stream to emit one tool call, got %d events=%#v", toolCalls, events)
+	}
+	if strings.Contains(textContent.String(), "<invoke") || strings.Contains(textContent.String(), "</tool_calls>") {
+		t.Fatalf("expected repaired missing-wrapper stream not to leak xml text, got %q", textContent.String())
+	}
+}

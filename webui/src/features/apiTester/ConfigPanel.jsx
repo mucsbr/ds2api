@@ -10,6 +10,8 @@ import {
 } from 'lucide-react'
 import clsx from 'clsx'
 
+import { maskSecret } from '../../utils/maskSecret'
+
 export default function ConfigPanel({
     t,
     configExpanded,
@@ -40,6 +42,7 @@ export default function ConfigPanel({
     }
     const selectedModel = models.find(m => m.id === model) || models[0]
     const SelectedModelIcon = selectedModel ? (iconMap[selectedModel.icon] || MessageSquare) : MessageSquare
+    const defaultKeyPreview = maskSecret(config.keys?.[0])
 
     return (
         <div className={clsx(
@@ -158,7 +161,7 @@ export default function ConfigPanel({
                             autoComplete="off"
                             spellCheck={false}
                             className="w-full h-10 px-3 bg-muted/30 border border-border rounded-lg text-sm font-mono placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-ring focus:border-ring transition-all"
-                            placeholder={config.keys?.[0] ? t('apiTester.apiKeyDefault', { suffix: config.keys[0].slice(-6) }) : t('apiTester.apiKeyPlaceholder')}
+                            placeholder={defaultKeyPreview ? t('apiTester.apiKeyDefault', { preview: defaultKeyPreview }) : t('apiTester.apiKeyPlaceholder')}
                             value={apiKey}
                             onChange={e => setApiKey(e.target.value)}
                         />

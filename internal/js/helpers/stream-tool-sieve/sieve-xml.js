@@ -1,31 +1,27 @@
 'use strict';
 const { parseToolCalls } = require('./parse');
 
-// Tag pairs ordered longest-first: wrapper tags checked before inner tags.
+// XML wrapper tag pair used by the streaming sieve.
 const XML_TOOL_TAG_PAIRS = [
   { open: '<tool_calls', close: '</tool_calls>' },
-  { open: '<tool_call', close: '</tool_call>' },
-  { open: '<function_calls', close: '</function_calls>' },
-  { open: '<function_call', close: '</function_call>' },
-  { open: '<invoke', close: '</invoke>' },
-  { open: '<tool_use', close: '</tool_use>' },
 ];
 
 const XML_TOOL_OPENING_TAGS = XML_TOOL_TAG_PAIRS.map(p => p.open);
 
 function consumeXMLToolCapture(captured, toolNames, trimWrappingJSONFence) {
   const lower = captured.toLowerCase();
-  // Find the FIRST matching open/close pair, preferring wrapper tags.
+  // Find the FIRST matching open/close pair for the canonical wrapper.
   for (const pair of XML_TOOL_TAG_PAIRS) {
     const openIdx = lower.indexOf(pair.open);
     if (openIdx < 0) {
       continue;
     }
-    // Find the LAST occurrence of the specific closing tag.
-    const closeIdx = lower.lastIndexOf(pair.close);
-    if (closeIdx < openIdx) {
+    // Ignore closing tags that appear inside CDATA payloads, such as
+    // write-file content containing tool-call documentation examples.
+    const closeIdx = findXMLCloseOutsideCDATA(captured, pair.close, openIdx + pair.open.length);
+    if (closeIdx < 0) {
       // Opening tag present but specific closing tag hasn't arrived.
-      // Return not-ready — do NOT fall through to inner pairs.
+      // Return not-ready so buffering continues until the wrapper closes.
       return { ready: false, prefix: '', calls: [], suffix: '' };
     }
     const closeEnd = closeIdx + pair.close.length;
@@ -51,8 +47,9 @@ function consumeXMLToolCapture(captured, toolNames, trimWrappingJSONFence) {
 function hasOpenXMLToolTag(captured) {
   const lower = captured.toLowerCase();
   for (const pair of XML_TOOL_TAG_PAIRS) {
-    if (lower.includes(pair.open)) {
-      if (!lower.includes(pair.close)) {
+    const openIdx = lower.indexOf(pair.open);
+    if (openIdx >= 0) {
+      if (findXMLCloseOutsideCDATA(captured, pair.close, openIdx + pair.open.length) < 0) {
         return true;
       }
     }
@@ -75,6 +72,38 @@ function findPartialXMLToolTagStart(s) {
     if (tagWithLT.startsWith(lowerTail)) {
       return lastLT;
     }
+  }
+  return -1;
+}
+
+function findXMLCloseOutsideCDATA(s, closeTag, start) {
+  const text = typeof s === 'string' ? s : '';
+  const target = String(closeTag || '').toLowerCase();
+  if (!text || !target) {
+    return -1;
+  }
+  const lower = text.toLowerCase();
+  for (let i = Math.max(0, start || 0); i < text.length;) {
+    if (lower.startsWith('<![cdata[', i)) {
+      const end = lower.indexOf(']]>', i + '<![cdata['.length);
+      if (end < 0) {
+        return -1;
+      }
+      i = end + ']]>'.length;
+      continue;
+    }
+    if (lower.startsWith('<!--', i)) {
+      const end = lower.indexOf('-->', i + '<!--'.length);
+      if (end < 0) {
+        return -1;
+      }
+      i = end + '-->'.length;
+      continue;
+    }
+    if (lower.startsWith(target, i)) {
+      return i;
+    }
+    i += 1;
   }
   return -1;
 }

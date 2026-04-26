@@ -42,7 +42,7 @@ test('extractToolNames keeps only declared tool names (Go parity)', () => {
 });
 
 test('parseToolCalls parses XML markup tool call', () => {
-  const payload = '<tool_call><tool_name>read_file</tool_name><parameters>{"path":"README.MD"}</parameters></tool_call>';
+  const payload = '<tool_calls><invoke name="read_file"><parameter name="path">README.MD</parameter></invoke></tool_calls>';
   const calls = parseToolCalls(payload, ['read_file']);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].name, 'read_file');
@@ -61,32 +61,23 @@ test('parseToolCalls ignores tool_call payloads that exist only inside fenced co
   const text = [
     'I will call a tool now.',
     '```xml',
-    '<tool_call><tool_name>read_file</tool_name><parameters>{"path":"README.md"}</parameters></tool_call>',
+    '<tool_calls><invoke name="read_file"><parameter name="path">README.md</parameter></invoke></tool_calls>',
     '```',
   ].join('\n');
   const calls = parseToolCalls(text, ['read_file']);
   assert.equal(calls.length, 0);
 });
 
-test('parseToolCalls recovers wrapper-named tool tag style', () => {
-  const payload = '<tool_calls><read_file><path>README.md</path></read_file></tool_calls>';
-  const calls = parseToolCalls(payload, ['read_file']);
+test('parseToolCalls keeps unknown schema names when toolNames is provided', () => {
+  const payload = '<tool_calls><invoke name="not_in_schema"><parameter name="q">go</parameter></invoke></tool_calls>';
+  const calls = parseToolCalls(payload, ['search']);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].name, 'read_file');
-  assert.deepEqual(calls[0].input, { path: 'README.md' });
-});
-
-test('parseToolCalls sanitizes malformed tool name attribute', () => {
-  const payload = '<tool_call name="read_file`"><parameters><path>README.md</path></parameters></tool_call>';
-  const calls = parseToolCalls(payload, ['read_file']);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].name, 'read_file');
-  assert.deepEqual(calls[0].input, { path: 'README.md' });
+  assert.equal(calls[0].name, 'not_in_schema');
 });
 
 test('sieve emits tool_calls for XML tool call payload', () => {
   const events = runSieve(
-    ['<tool_call><tool_name>read_file</tool_name><parameters>{"path":"README.MD"}</parameters></tool_call>'],
+    ['<tool_calls><invoke name="read_file"><parameter name="path">README.MD</parameter></invoke></tool_calls>'],
     ['read_file'],
   );
   const finalCalls = events.filter((evt) => evt.type === 'tool_calls').flatMap((evt) => evt.calls || []);
@@ -94,26 +85,17 @@ test('sieve emits tool_calls for XML tool call payload', () => {
   assert.equal(finalCalls[0].name, 'read_file');
 });
 
-test('sieve emits tool_calls for wrapper-named tool tag style', () => {
+test('sieve emits tool_calls when XML tag spans multiple chunks', () => {
   const events = runSieve(
-    ['<tool_calls><read_file><path>README.md</path></read_file></tool_calls>'],
+    [
+      '<tool_calls><invoke name="read_file">',
+      '<parameter name="path">README.MD</parameter></invoke></tool_calls>',
+    ],
     ['read_file'],
   );
   const finalCalls = events.filter((evt) => evt.type === 'tool_calls').flatMap((evt) => evt.calls || []);
   assert.equal(finalCalls.length, 1);
   assert.equal(finalCalls[0].name, 'read_file');
-  assert.deepEqual(finalCalls[0].input, { path: 'README.md' });
-});
-
-test('sieve emits tool_calls for malformed name attribute after sanitization', () => {
-  const events = runSieve(
-    ['<tool_call name="read_file`"><parameters><path>README.md</path></parameters></tool_call>'],
-    ['read_file'],
-  );
-  const finalCalls = events.filter((evt) => evt.type === 'tool_calls').flatMap((evt) => evt.calls || []);
-  assert.equal(finalCalls.length, 1);
-  assert.equal(finalCalls[0].name, 'read_file');
-  assert.deepEqual(finalCalls[0].input, { path: 'README.md' });
 });
 
 test('sieve keeps long XML tool calls buffered until the closing tag arrives', () => {
@@ -121,10 +103,10 @@ test('sieve keeps long XML tool calls buffered until the closing tag arrives', (
   const splitAt = longContent.length / 2;
   const events = runSieve(
     [
-      '<tool_calls>\n  <tool_call>\n    <tool_name>write_to_file</tool_name>\n    <parameters>\n      <content><![CDATA[',
+      '<tool_calls>\n  <invoke name="write_to_file">\n    <parameter name="content"><![CDATA[',
       longContent.slice(0, splitAt),
       longContent.slice(splitAt),
-      ']]></content>\n    </parameters>\n  </tool_call>\n</tool_calls>',
+      ']]></parameter>\n  </invoke>\n</tool_calls>',
     ],
     ['write_to_file'],
   );
@@ -134,6 +116,60 @@ test('sieve keeps long XML tool calls buffered until the closing tag arrives', (
   assert.equal(finalCalls.length, 1);
   assert.equal(finalCalls[0].name, 'write_to_file');
   assert.equal(finalCalls[0].input.content, longContent);
+});
+
+test('sieve keeps CDATA tool examples buffered until the outer closing tag arrives', () => {
+  const content = [
+    '# DS2API 4.0 更新内容',
+    '',
+    'x'.repeat(4096),
+    '```xml',
+    '<tool_calls>',
+    '  <invoke name="demo">',
+    '    <parameter name="value">x</parameter>',
+    '  </invoke>',
+    '</tool_calls>',
+    '```',
+    'tail',
+  ].join('\n');
+  const innerClose = content.indexOf('</tool_calls>') + '</tool_calls>'.length;
+  const state = createToolSieveState();
+  const chunks = [
+    '<tool_calls>\n  <invoke name="Write">\n    <parameter name="content"><![CDATA[',
+    content.slice(0, innerClose),
+    content.slice(innerClose),
+    ']]></parameter>\n    <parameter name="file_path">DS2API-4.0-Release-Notes.md</parameter>\n  </invoke>\n</tool_calls>',
+  ];
+  const events = [];
+  chunks.forEach((chunk, idx) => {
+    const next = processToolSieveChunk(state, chunk, ['Write']);
+    if (idx <= 1) {
+      assert.deepEqual(next, []);
+    }
+    events.push(...next);
+  });
+  events.push(...flushToolSieve(state, ['Write']));
+
+  const leakedText = collectText(events);
+  const finalCalls = events.filter((evt) => evt.type === 'tool_calls').flatMap((evt) => evt.calls || []);
+  assert.equal(leakedText, '');
+  assert.equal(finalCalls.length, 1);
+  assert.equal(finalCalls[0].name, 'Write');
+  assert.equal(finalCalls[0].input.content, content);
+});
+
+test('parseToolCalls keeps XML-looking CDATA content intact', () => {
+  const content = [
+    '# Release notes',
+    '```xml',
+    '<tool_calls><invoke name="demo"><parameter name="value">x</parameter></invoke></tool_calls>',
+    '```',
+  ].join('\n');
+  const payload = `<tool_calls><invoke name="Write"><parameter name="content"><![CDATA[${content}]]></parameter><parameter name="file_path">DS2API-4.0-Release-Notes.md</parameter></invoke></tool_calls>`;
+  const calls = parseToolCalls(payload, ['Write']);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].input.content, content);
+  assert.equal(calls[0].input.file_path, 'DS2API-4.0-Release-Notes.md');
 });
 
 test('sieve passes JSON tool_calls payload through as text (XML-only)', () => {
@@ -165,7 +201,16 @@ test('sieve keeps embedded invalid tool-like json as normal text to avoid stream
 });
 
 test('sieve passes malformed executable-looking XML through as text', () => {
-  const chunk = '<tool_call><parameters>{"path":"README.MD"}</parameters></tool_call>';
+  const chunk = '<tool_calls><invoke name="read_file"><param>{"path":"README.MD"}</param></invoke></tool_calls>';
+  const events = runSieve([chunk], ['read_file']);
+  const leakedText = collectText(events);
+  const hasToolCalls = events.some((evt) => evt.type === 'tool_calls' && evt.calls?.length > 0);
+  assert.equal(hasToolCalls, false);
+  assert.equal(leakedText, chunk);
+});
+
+test('sieve keeps bare tool_call XML as plain text without wrapper', () => {
+  const chunk = '<invoke name="read_file"><parameter name="path">README.MD</parameter></invoke>';
   const events = runSieve([chunk], ['read_file']);
   const leakedText = collectText(events);
   const hasToolCalls = events.some((evt) => evt.type === 'tool_calls' && evt.calls?.length > 0);
@@ -178,13 +223,12 @@ test('sieve flushes incomplete captured XML tool blocks by falling back to raw t
     [
       '前置正文G。',
       '<tool_calls>\n',
-      '  <tool_call>\n',
-      '    <tool_name>read_file</tool_name>\n',
+      '  <invoke name="read_file">\n',
     ],
     ['read_file'],
   );
   const leakedText = collectText(events);
-  const expected = ['前置正文G。', '<tool_calls>\n', '  <tool_call>\n', '    <tool_name>read_file</tool_name>\n'].join('');
+  const expected = ['前置正文G。', '<tool_calls>\n', '  <invoke name="read_file">\n'].join('');
   const hasToolCalls = events.some((evt) => evt.type === 'tool_calls' && evt.calls?.length > 0);
   assert.equal(hasToolCalls, false);
   assert.equal(leakedText, expected);
@@ -194,7 +238,7 @@ test('sieve captures XML wrapper tags with attributes without leaking wrapper te
   const events = runSieve(
     [
       '前置正文H。',
-      '<tool_calls id="x"><tool_call><tool_name>read_file</tool_name><parameters>{"path":"README.MD"}</parameters></tool_call></tool_calls>',
+      '<tool_calls id="x"><invoke name="read_file"><parameter name="path">README.MD</parameter></invoke></tool_calls>',
       '后置正文I。',
     ],
     ['read_file'],
@@ -288,7 +332,7 @@ test('formatOpenAIStreamToolCalls reuses ids with the same idStore', () => {
 });
 
 test('parseToolCalls rejects mismatched markup tags', () => {
-  const payload = '<tool_call><name>read_file</function><arguments>{"path":"README.md"}</arguments></tool_call>';
+  const payload = '<tool_calls><invoke name="read_file"><parameter name="path">README.md</function></invoke></tool_calls>';
   const calls = parseToolCalls(payload, ['read_file']);
   assert.equal(calls.length, 0);
 });
