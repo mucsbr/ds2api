@@ -37,7 +37,7 @@ Docs: [Overview](README.en.md) / [Architecture](docs/ARCHITECTURE.en.md) / [Depl
 
 - OpenAI / Claude / Gemini protocols are now mounted on one shared `chi` router tree assembled in `internal/server/router.go`.
 - Adapter responsibilities are streamlined to: **request normalization → DeepSeek invocation → protocol-shaped rendering**, reducing legacy split-logic paths.
-- Tool-calling semantics are aligned between Go and Node runtime: the only executable model-output syntax is the canonical XML tool block `<tool_calls>` → `<invoke name="...">` → `<parameter name="...">`, plus stream-time anti-leak filtering.
+- Tool-calling semantics are aligned between Go and Node runtime: models should output the DSML shell `<|DSML|tool_calls>` → `<|DSML|invoke name="...">` → `<|DSML|parameter name="...">`; DS2API also accepts legacy canonical XML `<tool_calls>` → `<invoke name="...">` → `<parameter name="...">`. DSML is normalized back to XML at the parser entry, so internal parsing remains XML-based, with stream-time anti-leak filtering.
 - `Admin API` separates static config from runtime policy: `/admin/config*` for configuration state, `/admin/settings*` for runtime behavior.
 
 ---
@@ -334,7 +334,8 @@ When `tools` is present, DS2API performs anti-leak handling:
 
 Additional notes:
 
-- The parser currently treats only canonical XML tool blocks (`<tool_calls>` / `<invoke name="...">` / `<parameter name="...">`) as executable tool calls. Legacy `<tools>`, `<tool_call>`, `<tool_name>`, `<param>`, `<function_call>`, `tool_use`, antml variants, and standalone JSON `tool_calls` payloads are treated as plain text.
+- The parser treats DSML shell tool blocks (`<|DSML|tool_calls>` / `<|DSML|invoke name="...">` / `<|DSML|parameter name="...">`) and legacy canonical XML tool blocks (`<tool_calls>` / `<invoke name="...">` / `<parameter name="...">`) as executable tool calls. DSML is normalized back to XML at the parser entry; internal parsing remains XML-based. Legacy `<tools>`, `<tool_call>`, `<tool_name>`, `<param>`, `<function_call>`, `tool_use`, antml variants, and standalone JSON `tool_calls` payloads are treated as plain text.
+- If the final visible response text is empty but the reasoning stream contains an executable tool call, Chat / Responses emits a standard OpenAI `tool_calls` / `function_call` output during finalization. If thinking/reasoning was not enabled by the client, that reasoning text is used only for detection and is not exposed as visible text or `reasoning_content`.
 - `tool_calls` shown inside fenced markdown code blocks (for example, ```json ... ```) are treated as examples, not executable calls.
 
 ---
@@ -711,7 +712,7 @@ Reads runtime settings and status, including:
 - `compat` (`wide_input_strict_output`, `strip_reference_markers`)
 - `responses` / `embeddings`
 - `auto_delete` (`mode`: `none` / `single` / `all`; legacy `sessions=true` is still treated as `all`)
-- `history_split` (`enabled` always returns `true`, `trigger_after_turns`)
+- `current_input_file` (`enabled` defaults to `true`, plus `min_chars`)
 - `model_aliases`
 - `env_backed`, `needs_vercel_sync`
 - `toolcall` policy is fixed to `feature_match + high` and is no longer returned or editable via settings
@@ -726,8 +727,9 @@ Hot-updates runtime settings. Supported fields:
 - `responses.store_ttl_seconds`
 - `embeddings.provider`
 - `auto_delete.mode`
-- `history_split.trigger_after_turns` (`history_split.enabled` is forced on globally; legacy client writes are stored as `true`)
+- `current_input_file.enabled` / `current_input_file.min_chars`
 - `model_aliases`
+- `history_split` is retained only for legacy config compatibility and no longer affects requests
 - `toolcall` policy is fixed and is no longer writable through settings
 
 ### `POST /admin/settings/password`
@@ -751,9 +753,9 @@ Imports full config with:
 
 The request can send config directly, or wrapped as `{"config": {...}, "mode":"merge"}`.
 Query params `?mode=merge` / `?mode=replace` are also supported.
-`replace` mode replaces the full config shape while preserving Vercel sync metadata. `merge` mode merges `keys`, `api_keys`, `accounts`, and `model_aliases`, and overwrites non-empty fields under `admin`, `runtime`, `responses`, and `embeddings`. Manage `compat`, `auto_delete`, and `history_split` via `/admin/settings` or the config file; legacy `toolcall` fields are ignored.
+`replace` mode replaces the full config shape while preserving Vercel sync metadata. `merge` mode merges `keys`, `api_keys`, `accounts`, and `model_aliases`, and overwrites non-empty fields under `admin`, `runtime`, `responses`, and `embeddings`. Manage `compat`, `auto_delete`, and `current_input_file` via `/admin/settings` or the config file; `history_split` remains only for legacy compatibility; legacy `toolcall` fields are ignored.
 
-> Note: `merge` mode does not update `compat`, `auto_delete`, or `history_split`.
+> Note: `merge` mode does not update `compat`, `auto_delete`, or `current_input_file`.
 
 ### `GET /admin/config/export`
 

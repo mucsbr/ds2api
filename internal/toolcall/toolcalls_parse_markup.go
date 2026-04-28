@@ -2,6 +2,7 @@ package toolcall
 
 import (
 	"encoding/json"
+	"encoding/xml"
 	"html"
 	"regexp"
 	"strings"
@@ -10,6 +11,7 @@ import (
 var xmlAttrPattern = regexp.MustCompile(`(?is)\b([a-z0-9_:-]+)\s*=\s*("([^"]*)"|'([^']*)')`)
 var xmlToolCallsClosePattern = regexp.MustCompile(`(?is)</tool_calls>`)
 var xmlInvokeStartPattern = regexp.MustCompile(`(?is)<invoke\b[^>]*\bname\s*=\s*("([^"]*)"|'([^']*)')`)
+var cdataBRSeparatorPattern = regexp.MustCompile(`(?i)<br\s*/?>`)
 
 func parseXMLToolCalls(text string) []ParsedToolCall {
 	wrappers := findXMLElementBlocks(text, "tool_calls")
@@ -91,7 +93,7 @@ func parseSingleXMLToolCall(block xmlElementBlock) (ParsedToolCall, bool) {
 		if paramName == "" {
 			continue
 		}
-		value := parseInvokeParameterValue(paramMatch.Body)
+		value := parseInvokeParameterValue(paramName, paramMatch.Body)
 		appendMarkupValue(input, paramName, value)
 	}
 
@@ -124,7 +126,8 @@ func findXMLElementBlocks(text, tag string) []xmlElementBlock {
 		}
 		closeStart, closeEnd, ok := findMatchingXMLEndTagOutsideCDATA(text, tag, bodyStart)
 		if !ok {
-			break
+			pos = bodyStart
+			continue
 		}
 		out = append(out, xmlElementBlock{
 			Attrs: attrs,
@@ -288,21 +291,158 @@ func parseXMLTagAttributes(raw string) map[string]string {
 	return out
 }
 
-func parseInvokeParameterValue(raw string) any {
+func parseInvokeParameterValue(paramName, raw string) any {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return ""
 	}
 	if value, ok := extractStandaloneCDATA(trimmed); ok {
+		if parsed, ok := parseJSONLiteralValue(value); ok {
+			return parsed
+		}
+		if parsed, ok := parseStructuredCDATAParameterValue(paramName, value); ok {
+			return parsed
+		}
 		return value
 	}
-	if parsed := parseStructuredToolCallInput(trimmed); len(parsed) > 0 {
-		if len(parsed) == 1 {
-			if rawValue, ok := parsed["_raw"].(string); ok {
-				return rawValue
+	decoded := html.UnescapeString(extractRawTagValue(trimmed))
+	if strings.Contains(decoded, "<") && strings.Contains(decoded, ">") {
+		if parsedValue, ok := parseXMLFragmentValue(decoded); ok {
+			switch v := parsedValue.(type) {
+			case map[string]any:
+				if len(v) > 0 {
+					return v
+				}
+			case []any:
+				return v
+			case string:
+				text := strings.TrimSpace(v)
+				if text == "" {
+					return ""
+				}
+				if parsedText, ok := parseJSONLiteralValue(text); ok {
+					return parsedText
+				}
+				return v
+			default:
+				return v
 			}
 		}
+		if parsed := parseStructuredToolCallInput(decoded); len(parsed) > 0 {
+			if len(parsed) == 1 {
+				if rawValue, ok := parsed["_raw"].(string); ok {
+					return rawValue
+				}
+			}
+			return parsed
+		}
+	}
+	if parsed, ok := parseJSONLiteralValue(decoded); ok {
 		return parsed
 	}
-	return html.UnescapeString(extractRawTagValue(trimmed))
+	return decoded
+}
+
+func parseStructuredCDATAParameterValue(paramName, raw string) (any, bool) {
+	if preservesCDATAStringParameter(paramName) {
+		return nil, false
+	}
+	normalized := normalizeCDATAForStructuredParse(raw)
+	if !strings.Contains(normalized, "<") || !strings.Contains(normalized, ">") {
+		return nil, false
+	}
+	if !cdataFragmentLooksExplicitlyStructured(normalized) {
+		return nil, false
+	}
+	parsed, ok := parseXMLFragmentValue(normalized)
+	if !ok {
+		return nil, false
+	}
+	switch v := parsed.(type) {
+	case []any:
+		return v, true
+	case map[string]any:
+		if len(v) == 0 {
+			return nil, false
+		}
+		return v, true
+	default:
+		return nil, false
+	}
+}
+
+func normalizeCDATAForStructuredParse(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	normalized := cdataBRSeparatorPattern.ReplaceAllString(raw, "\n")
+	return html.UnescapeString(strings.TrimSpace(normalized))
+}
+
+// Preserve flat CDATA fragments as strings. Only recover structure when the
+// fragment clearly encodes a data shape: multiple sibling elements, nested
+// child elements, or an explicit item list.
+func cdataFragmentLooksExplicitlyStructured(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
+	}
+
+	dec := xml.NewDecoder(strings.NewReader("<root>" + trimmed + "</root>"))
+	tok, err := dec.Token()
+	if err != nil {
+		return false
+	}
+	start, ok := tok.(xml.StartElement)
+	if !ok || !strings.EqualFold(start.Name.Local, "root") {
+		return false
+	}
+
+	depth := 0
+	directChildren := 0
+	firstChildName := ""
+	firstChildHasNested := false
+
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if depth == 0 {
+				directChildren++
+				if directChildren == 1 {
+					firstChildName = strings.ToLower(strings.TrimSpace(t.Name.Local))
+				} else {
+					return true
+				}
+			} else if directChildren == 1 && depth == 1 {
+				firstChildHasNested = true
+			}
+			depth++
+		case xml.EndElement:
+			if strings.EqualFold(t.Name.Local, "root") {
+				if directChildren != 1 {
+					return false
+				}
+				if firstChildName == "item" {
+					return true
+				}
+				return firstChildHasNested
+			}
+			if depth > 0 {
+				depth--
+			}
+		}
+	}
+}
+
+func preservesCDATAStringParameter(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "content", "file_content", "text", "prompt", "query", "command", "cmd", "script", "code", "old_string", "new_string", "pattern", "path", "file_path":
+		return true
+	default:
+		return false
+	}
 }

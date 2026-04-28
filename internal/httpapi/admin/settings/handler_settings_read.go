@@ -6,6 +6,7 @@ import (
 
 	authn "ds2api/internal/auth"
 	"ds2api/internal/config"
+	"ds2api/internal/promptcompat"
 )
 
 func (h *Handler) getSettings(w http.ResponseWriter, _ *http.Request) {
@@ -30,9 +31,14 @@ func (h *Handler) getSettings(w http.ResponseWriter, _ *http.Request) {
 		"responses":   snap.Responses,
 		"embeddings":  snap.Embeddings,
 		"auto_delete": snap.AutoDelete,
-		"history_split": map[string]any{
-			"enabled":             h.Store.HistorySplitEnabled(),
-			"trigger_after_turns": h.Store.HistorySplitTriggerAfterTurns(),
+		"current_input_file": map[string]any{
+			"enabled":   h.Store.CurrentInputFileEnabled(),
+			"min_chars": h.Store.CurrentInputFileMinChars(),
+		},
+		"thinking_injection": map[string]any{
+			"enabled":        h.Store.ThinkingInjectionEnabled(),
+			"prompt":         h.Store.ThinkingInjectionPrompt(),
+			"default_prompt": promptcompat.DefaultThinkingInjectionPrompt,
 		},
 		"model_aliases":     snap.ModelAliases,
 		"env_backed":        h.Store.IsEnvBacked(),

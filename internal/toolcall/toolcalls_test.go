@@ -30,6 +30,69 @@ func TestParseToolCallsSupportsToolCallsWrapper(t *testing.T) {
 	}
 }
 
+func TestParseToolCallsSupportsDSMLShell(t *testing.T) {
+	text := `<|DSML|tool_calls><|DSML|invoke name="Bash"><|DSML|parameter name="command"><![CDATA[pwd]]></|DSML|parameter></|DSML|invoke></|DSML|tool_calls>`
+	calls := ParseToolCalls(text, []string{"Bash"})
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 DSML call, got %#v", calls)
+	}
+	if calls[0].Name != "Bash" || calls[0].Input["command"] != "pwd" {
+		t.Fatalf("unexpected DSML parse result: %#v", calls[0])
+	}
+}
+
+func TestParseToolCallsSupportsDSMLShellWithCanonicalExampleInCDATA(t *testing.T) {
+	content := `<tool_calls><invoke name="demo"><parameter name="value">x</parameter></invoke></tool_calls>`
+	text := `<|DSML|tool_calls><|DSML|invoke name="Write"><|DSML|parameter name="file_path">notes.md</|DSML|parameter><|DSML|parameter name="content"><![CDATA[` + content + `]]></|DSML|parameter></|DSML|invoke></|DSML|tool_calls>`
+	calls := ParseToolCalls(text, []string{"Write"})
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 DSML call with XML-looking CDATA, got %#v", calls)
+	}
+	if calls[0].Name != "Write" || calls[0].Input["content"] != content {
+		t.Fatalf("unexpected DSML CDATA parse result: %#v", calls[0])
+	}
+}
+
+func TestParseToolCallsPreservesSimpleCDATAInlineMarkupAsText(t *testing.T) {
+	text := `<tool_calls><invoke name="Write"><parameter name="description"><![CDATA[<b>urgent</b>]]></parameter></invoke></tool_calls>`
+	calls := ParseToolCalls(text, []string{"Write"})
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call, got %#v", calls)
+	}
+	got, ok := calls[0].Input["description"].(string)
+	if !ok {
+		t.Fatalf("expected description to remain a string, got %#v", calls[0].Input["description"])
+	}
+	if got != "<b>urgent</b>" {
+		t.Fatalf("expected inline markup CDATA to stay raw, got %q", got)
+	}
+}
+
+func TestParseToolCallsTreatsUnclosedCDATAAsText(t *testing.T) {
+	text := `<tool_calls><invoke name="Write"><parameter name="content"><![CDATA[hello world</parameter></invoke></tool_calls>`
+	res := ParseToolCallsDetailed(text, []string{"Write"})
+	if len(res.Calls) != 1 {
+		t.Fatalf("expected unclosed CDATA to still parse via outer wrapper, got %#v", res.Calls)
+	}
+	got, _ := res.Calls[0].Input["content"].(string)
+	if got != "hello world" {
+		t.Fatalf("expected recovered CDATA payload, got %q", got)
+	}
+}
+
+func TestParseToolCallsNormalizesMixedDSMLAndCanonicalToolTags(t *testing.T) {
+	// Models commonly mix DSML wrapper tags with canonical inner tags.
+	// These should be normalized and parsed, not rejected.
+	text := `<|DSML|tool_calls><invoke name="Bash"><|DSML|parameter name="command">pwd</|DSML|parameter></invoke></|DSML|tool_calls>`
+	calls := ParseToolCalls(text, []string{"Bash"})
+	if len(calls) != 1 {
+		t.Fatalf("expected mixed DSML/XML tool tags to be normalized and parsed, got %#v", calls)
+	}
+	if calls[0].Name != "Bash" || calls[0].Input["command"] != "pwd" {
+		t.Fatalf("unexpected mixed DSML parse result: %#v", calls[0])
+	}
+}
+
 func TestParseToolCallsSupportsStandaloneToolWithMultilineCDATAAndRepeatedXMLTags(t *testing.T) {
 	text := `<tool_calls><invoke name="write_file"><parameter name="path">script.sh</parameter><parameter name="content"><![CDATA[#!/bin/bash
 echo "hello"
@@ -91,6 +154,114 @@ func TestParseToolCallsSupportsInvokeParameters(t *testing.T) {
 	}
 	if calls[0].Input["city"] != "beijing" || calls[0].Input["unit"] != "c" {
 		t.Fatalf("expected parsed json parameters, got %#v", calls[0].Input)
+	}
+}
+
+func TestParseToolCallsSupportsJSONScalarParameters(t *testing.T) {
+	text := `<tool_calls><invoke name="configure"><parameter name="count">123</parameter><parameter name="max_tokens"><![CDATA[256]]></parameter><parameter name="enabled">true</parameter></invoke></tool_calls>`
+	calls := ParseToolCalls(text, []string{"configure"})
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call, got %#v", calls)
+	}
+	if got, ok := calls[0].Input["count"].(float64); !ok || got != 123 {
+		t.Fatalf("expected numeric count, got %#v", calls[0].Input["count"])
+	}
+	if got, ok := calls[0].Input["max_tokens"].(float64); !ok || got != 256 {
+		t.Fatalf("expected numeric max_tokens, got %#v", calls[0].Input["max_tokens"])
+	}
+	if got, ok := calls[0].Input["enabled"].(bool); !ok || !got {
+		t.Fatalf("expected boolean enabled, got %#v", calls[0].Input["enabled"])
+	}
+}
+
+func TestParseToolCallsTreatsItemOnlyParameterBodyAsArray(t *testing.T) {
+	text := strings.Join([]string{
+		`<|DSML|tool_calls>`,
+		`<|DSML|invoke name="AskUserQuestion">`,
+		`<|DSML|parameter name="questions">`,
+		`<item>`,
+		`<question><![CDATA[What would you like to do next?]]></question>`,
+		`<header><![CDATA[Next step]]></header>`,
+		`<options>`,
+		`<item><label><![CDATA[Run tests]]></label><description><![CDATA[Run the test suite]]></description></item>`,
+		`<item><label><![CDATA[Other task]]></label><description><![CDATA[Something else entirely]]></description></item>`,
+		`</options>`,
+		`<multiSelect>false</multiSelect>`,
+		`</item>`,
+		`</|DSML|parameter>`,
+		`</|DSML|invoke>`,
+		`</|DSML|tool_calls>`,
+	}, "\n")
+	calls := ParseToolCalls(text, []string{"AskUserQuestion"})
+	if len(calls) != 1 {
+		t.Fatalf("expected one AskUserQuestion call, got %#v", calls)
+	}
+	questions, ok := calls[0].Input["questions"].([]any)
+	if !ok || len(questions) != 1 {
+		t.Fatalf("expected questions to parse as array, got %#v", calls[0].Input["questions"])
+	}
+	first, ok := questions[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected first question object, got %#v", questions[0])
+	}
+	if first["question"] != "What would you like to do next?" || first["header"] != "Next step" || first["multiSelect"] != false {
+		t.Fatalf("unexpected question payload: %#v", first)
+	}
+	options, ok := first["options"].([]any)
+	if !ok || len(options) != 2 {
+		t.Fatalf("expected options to parse as array, got %#v", first["options"])
+	}
+}
+
+func TestParseToolCallsTreatsCDATAItemOnlyBodyAsArray(t *testing.T) {
+	todos := `<br>  <item><br>    <activeForm>Testing EnterWorktree tool</activeForm><br>    <content>Test EnterWorktree tool</content><br>    <status>in_progress</status><br>  </item><br>  <item><br>    <activeForm>Testing TodoWrite tool</activeForm><br>    <content>Test TodoWrite tool</content><br>    <status>completed</status><br>  </item><br>`
+	text := `<|DSML|tool_calls><|DSML|invoke name="TodoWrite"><|DSML|parameter name="todos"><![CDATA[` + todos + `]]></|DSML|parameter></|DSML|invoke></|DSML|tool_calls>`
+	calls := ParseToolCalls(text, []string{"TodoWrite"})
+	if len(calls) != 1 {
+		t.Fatalf("expected one TodoWrite call, got %#v", calls)
+	}
+	items, ok := calls[0].Input["todos"].([]any)
+	if !ok || len(items) != 2 {
+		t.Fatalf("expected todos CDATA item body to parse as array, got %#v", calls[0].Input["todos"])
+	}
+	first, ok := items[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected first todo object, got %#v", items[0])
+	}
+	if first["activeForm"] != "Testing EnterWorktree tool" || first["content"] != "Test EnterWorktree tool" || first["status"] != "in_progress" {
+		t.Fatalf("unexpected first todo: %#v", first)
+	}
+}
+
+func TestParseToolCallsTreatsSingleItemCDATAAsArray(t *testing.T) {
+	text := `<tool_calls><invoke name="TodoWrite"><parameter name="todos"><![CDATA[<item>one</item>]]></parameter></invoke></tool_calls>`
+	calls := ParseToolCalls(text, []string{"TodoWrite"})
+	if len(calls) != 1 {
+		t.Fatalf("expected one TodoWrite call, got %#v", calls)
+	}
+	items, ok := calls[0].Input["todos"].([]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("expected single-item CDATA body to parse as array, got %#v", calls[0].Input["todos"])
+	}
+	if got, ok := items[0].(string); !ok || got != "one" {
+		t.Fatalf("expected single item value to stay intact, got %#v", items[0])
+	}
+}
+
+func TestParseToolCallsTreatsCDATAObjectFragmentAsObject(t *testing.T) {
+	payload := `<question><![CDATA[Pick one]]></question><options><item><label><![CDATA[A]]></label></item><item><label><![CDATA[B]]></label></item></options>`
+	text := `<tool_calls><invoke name="AskUserQuestion"><parameter name="questions"><![CDATA[` + payload + `]]></parameter></invoke></tool_calls>`
+	calls := ParseToolCalls(text, []string{"AskUserQuestion"})
+	if len(calls) != 1 {
+		t.Fatalf("expected one AskUserQuestion call, got %#v", calls)
+	}
+	question, ok := calls[0].Input["questions"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected CDATA XML object fragment to parse as object, got %#v", calls[0].Input["questions"])
+	}
+	options, ok := question["options"].([]any)
+	if question["question"] != "Pick one" || !ok || len(options) != 2 {
+		t.Fatalf("unexpected parsed question: %#v", question)
 	}
 }
 
@@ -405,5 +576,104 @@ func TestParseToolCallsParsesAfterFourBacktickFence(t *testing.T) {
 	}
 	if res.Calls[0].Name != "search" {
 		t.Fatalf("expected non-fenced tool call to be parsed, got %#v", res.Calls[0])
+	}
+}
+
+func TestParseToolCallsToleratesDSMLSpaceSeparatorTypo(t *testing.T) {
+	text := strings.Join([]string{
+		"<|DSML tool_calls>",
+		"<|DSML invoke name=\"Read\">",
+		"<|DSML parameter name=\"file_path\"><![CDATA[/tmp/input.txt]]></|DSML parameter>",
+		"</|DSML invoke>",
+		"</|DSML tool_calls>",
+	}, "\n")
+	calls := ParseToolCalls(text, []string{"Read"})
+	if len(calls) != 1 {
+		t.Fatalf("expected one call from DSML space-separator typo, got %#v", calls)
+	}
+	if calls[0].Name != "Read" {
+		t.Fatalf("expected Read call, got %#v", calls[0])
+	}
+	if got, _ := calls[0].Input["file_path"].(string); got != "/tmp/input.txt" {
+		t.Fatalf("expected file_path to parse, got %q", got)
+	}
+}
+
+func TestParseToolCallsDoesNotAcceptDSMLSpaceLookalikeTagName(t *testing.T) {
+	text := strings.Join([]string{
+		"<|DSML tool_calls_extra>",
+		"<|DSML invoke name=\"Read\">",
+		"<|DSML parameter name=\"file_path\">/tmp/input.txt</|DSML parameter>",
+		"</|DSML invoke>",
+		"</|DSML tool_calls_extra>",
+	}, "\n")
+	calls := ParseToolCalls(text, []string{"Read"})
+	if len(calls) != 0 {
+		t.Fatalf("expected no calls from lookalike tag, got %#v", calls)
+	}
+}
+
+func TestParseToolCallsToleratesDSMLCollapsedTagNames(t *testing.T) {
+	todos := `[x] 检查 toolcalls_format.go 格式化逻辑
+[x] 检查 toolcalls_parse.go 解析逻辑
+[x] 检查 toolcalls_xml.go 和 toolcalls_dsml.go
+[x] 检查 toolcalls_markup.go 和 toolcalls_json_repair.go
+[x] 检查 prompt/tool_calls.go 注入逻辑
+[x] 检查 toolstream 流式解析
+[x] 查看测试文件确认预期行为
+[x] 给出调查结论`
+	text := strings.Join([]string{
+		"[]",
+		"<DSMLtool_calls>",
+		"<DSMLinvoke name=\"update_todo_list\">",
+		"<DSMLparameter name=\"todos\"><![CDATA[" + todos + "]]></DSMLparameter>",
+		"</DSMLinvoke>",
+		"</DSMLtool_calls>",
+	}, "\n")
+	calls := ParseToolCalls(text, []string{"update_todo_list"})
+	if len(calls) != 1 {
+		t.Fatalf("expected one call from collapsed DSML tags, got %#v", calls)
+	}
+	if calls[0].Name != "update_todo_list" {
+		t.Fatalf("expected update_todo_list call, got %#v", calls[0])
+	}
+	if got, _ := calls[0].Input["todos"].(string); got != todos {
+		t.Fatalf("expected todos to round-trip, got %q", got)
+	}
+}
+
+func TestParseToolCallsDoesNotAcceptDSMLCollapsedLookalikeTagName(t *testing.T) {
+	text := strings.Join([]string{
+		"<DSMLtool_calls_extra>",
+		"<DSMLinvoke name=\"update_todo_list\">",
+		"<DSMLparameter name=\"todos\">x</DSMLparameter>",
+		"</DSMLinvoke>",
+		"</DSMLtool_calls_extra>",
+	}, "\n")
+	calls := ParseToolCalls(text, []string{"update_todo_list"})
+	if len(calls) != 0 {
+		t.Fatalf("expected no calls from collapsed lookalike tag, got %#v", calls)
+	}
+}
+
+func TestParseToolCallsSkipsProseMentionOfSameWrapperVariant(t *testing.T) {
+	text := strings.Join([]string{
+		"Summary: support canonical <tool_calls> and DSML <|DSML|tool_calls> wrappers.",
+		"",
+		"<|DSML|tool_calls>",
+		"<|DSML|invoke name=\"Bash\">",
+		"<|DSML|parameter name=\"command\"><![CDATA[git status]]></|DSML|parameter>",
+		"</|DSML|invoke>",
+		"</|DSML|tool_calls>",
+	}, "\n")
+	res := ParseToolCallsDetailed(text, []string{"Bash"})
+	if len(res.Calls) != 1 {
+		t.Fatalf("expected one parsed call after prose mention, got %#v", res.Calls)
+	}
+	if res.Calls[0].Name != "Bash" {
+		t.Fatalf("expected Bash call, got %#v", res.Calls[0])
+	}
+	if got, _ := res.Calls[0].Input["command"].(string); got != "git status" {
+		t.Fatalf("expected command to parse, got %q", got)
 	}
 }

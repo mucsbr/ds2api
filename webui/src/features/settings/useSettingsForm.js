@@ -17,7 +17,8 @@ const DEFAULT_FORM = {
     responses: { store_ttl_seconds: 900 },
     embeddings: { provider: '' },
     auto_delete: { mode: 'none' },
-    history_split: { enabled: true, trigger_after_turns: 1 },
+    current_input_file: { enabled: true, min_chars: 0 },
+    thinking_injection: { enabled: true, prompt: '', default_prompt: '' },
     model_aliases_text: '{}',
 }
 
@@ -50,6 +51,7 @@ function normalizeAutoDeleteMode(raw) {
 }
 
 function fromServerForm(data) {
+    const currentInputFileEnabled = data.current_input_file?.enabled ?? true
     return {
         admin: { jwt_expire_hours: Number(data.admin?.jwt_expire_hours || 24) },
         runtime: {
@@ -70,15 +72,21 @@ function fromServerForm(data) {
         auto_delete: {
             mode: normalizeAutoDeleteMode(data.auto_delete),
         },
-        history_split: {
-            enabled: true,
-            trigger_after_turns: Number(data.history_split?.trigger_after_turns || 1),
+        current_input_file: {
+            enabled: currentInputFileEnabled,
+            min_chars: Number(data.current_input_file?.min_chars ?? 0),
+        },
+        thinking_injection: {
+            enabled: data.thinking_injection?.enabled ?? true,
+            prompt: data.thinking_injection?.prompt || '',
+            default_prompt: data.thinking_injection?.default_prompt || '',
         },
         model_aliases_text: JSON.stringify(data.model_aliases || {}, null, 2),
     }
 }
 
 function toServerPayload(form) {
+    const currentInputFileEnabled = Boolean(form.current_input_file?.enabled)
     return {
         admin: { jwt_expire_hours: Number(form.admin.jwt_expire_hours) },
         runtime: {
@@ -93,9 +101,13 @@ function toServerPayload(form) {
         responses: { store_ttl_seconds: Number(form.responses.store_ttl_seconds) },
         embeddings: { provider: String(form.embeddings.provider || '').trim() },
         auto_delete: { mode: normalizeAutoDeleteMode(form.auto_delete) },
-        history_split: {
-            enabled: true,
-            trigger_after_turns: Number(form.history_split?.trigger_after_turns || 1),
+        current_input_file: {
+            enabled: currentInputFileEnabled,
+            min_chars: Number(form.current_input_file?.min_chars ?? 0),
+        },
+        thinking_injection: {
+            enabled: Boolean(form.thinking_injection?.enabled ?? true),
+            prompt: String(form.thinking_injection?.prompt || '').trim(),
         },
     }
 }
