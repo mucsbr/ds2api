@@ -73,6 +73,7 @@ func (p *Pool) Reset() {
 	config.Logger.Info(
 		"[init_account_queue] initialized",
 		"total", len(ids),
+		"accounts", ids,
 		"max_inflight_per_account", p.maxInflightPerAccount,
 		"global_max_inflight", p.globalMaxInflight,
 		"recommended_concurrency", p.recommendedConcurrency,
@@ -129,4 +130,14 @@ func (p *Pool) Status() map[string]any {
 		"waiting":                  len(p.waiters),
 		"max_queue_size":           p.maxQueueSize,
 	}
+}
+
+func (p *Pool) availableCountLocked() int {
+	available := 0
+	for _, id := range p.queue {
+		if p.canAcquireIDLocked(id) {
+			available++
+		}
+	}
+	return available
 }

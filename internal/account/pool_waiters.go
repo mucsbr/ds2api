@@ -15,6 +15,39 @@ func (p *Pool) canQueueLocked(target string, exclude map[string]bool) bool {
 	return len(p.waiters) < p.maxQueueSize
 }
 
+func (p *Pool) queueBlockReasonLocked(target string, exclude map[string]bool) string {
+	if target != "" {
+		if exclude[target] {
+			return "target_excluded"
+		}
+		if _, ok := p.store.FindAccount(target); !ok {
+			return "target_not_found"
+		}
+		if !p.canAcquireIDLocked(target) {
+			if p.inUse[target] >= p.maxInflightPerAccount {
+				return "target_inflight_limit"
+			}
+			if p.globalMaxInflight > 0 && p.currentInUseLocked() >= p.globalMaxInflight {
+				return "global_inflight_limit"
+			}
+			return "target_unavailable"
+		}
+	}
+	if p.maxQueueSize <= 0 {
+		return "queue_disabled"
+	}
+	if len(p.waiters) >= p.maxQueueSize {
+		return "queue_full"
+	}
+	if p.availableCountLocked() == 0 {
+		if p.globalMaxInflight > 0 && p.currentInUseLocked() >= p.globalMaxInflight {
+			return "global_inflight_limit"
+		}
+		return "all_accounts_busy"
+	}
+	return "unknown"
+}
+
 func (p *Pool) notifyWaiterLocked() {
 	if len(p.waiters) == 0 {
 		return

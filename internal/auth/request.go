@@ -60,7 +60,13 @@ func (r *Resolver) Determine(req *http.Request) (*RequestAuth, error) {
 	}
 	callerID := callerTokenID(callerKey)
 	ctx := req.Context()
+	target := strings.TrimSpace(req.Header.Get("X-Ds2-Target-Account"))
 	if !r.Store.HasAPIKey(callerKey) {
+		config.Logger.Info("[auth] direct token mode",
+			"caller", callerID,
+			"path", requestPath(req),
+			"target_account", target,
+		)
 		return &RequestAuth{
 			UseConfigToken: false,
 			DeepSeekToken:  callerKey,
@@ -69,11 +75,28 @@ func (r *Resolver) Determine(req *http.Request) (*RequestAuth, error) {
 			TriedAccounts:  map[string]bool{},
 		}, nil
 	}
-	target := strings.TrimSpace(req.Header.Get("X-Ds2-Target-Account"))
+	config.Logger.Info("[auth] managed account mode",
+		"caller", callerID,
+		"path", requestPath(req),
+		"target_account", target,
+		"configured_accounts", len(r.Store.Accounts()),
+	)
 	a, err := r.acquireManagedRequestAuth(ctx, callerID, target)
 	if err != nil {
+		config.Logger.Warn("[auth] managed acquire failed",
+			"caller", callerID,
+			"path", requestPath(req),
+			"target_account", target,
+			"error", err,
+		)
 		return nil, err
 	}
+	config.Logger.Info("[auth] managed account acquired",
+		"caller", callerID,
+		"path", requestPath(req),
+		"target_account", target,
+		"account", a.AccountID,
+	)
 	return a, nil
 }
 
@@ -85,6 +108,12 @@ func (r *Resolver) acquireManagedRequestAuth(ctx context.Context, callerID, targ
 			if lastEnsureErr != nil {
 				return nil, lastEnsureErr
 			}
+			config.Logger.Warn("[auth] exhausted managed accounts",
+				"caller", callerID,
+				"target_account", target,
+				"tried_accounts", mapKeys(tried),
+				"configured_accounts", len(r.Store.Accounts()),
+			)
 			return nil, ErrNoAccount
 		}
 		acc, ok := r.Pool.AcquireWait(ctx, target, tried)
@@ -92,6 +121,13 @@ func (r *Resolver) acquireManagedRequestAuth(ctx context.Context, callerID, targ
 			if lastEnsureErr != nil {
 				return nil, lastEnsureErr
 			}
+			config.Logger.Warn("[auth] no managed account available",
+				"caller", callerID,
+				"target_account", target,
+				"tried_accounts", mapKeys(tried),
+				"configured_accounts", len(r.Store.Accounts()),
+				"context_err", ctx.Err(),
+			)
 			return nil, ErrNoAccount
 		}
 
@@ -107,6 +143,13 @@ func (r *Resolver) acquireManagedRequestAuth(ctx context.Context, callerID, targ
 		if err := r.ensureManagedToken(ctx, a); err != nil {
 			lastEnsureErr = err
 			tried[a.AccountID] = true
+			config.Logger.Warn("[auth] ensure managed token failed",
+				"caller", callerID,
+				"account", a.AccountID,
+				"target_account", target,
+				"tried_accounts", mapKeys(tried),
+				"error", err,
+			)
 			r.Pool.Release(a.AccountID)
 			if target != "" {
 				return nil, err
@@ -299,4 +342,24 @@ func (r *Resolver) clearTokenRefreshMark(accountID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.tokenRefreshedAt, accountID)
+}
+
+func requestPath(req *http.Request) string {
+	if req == nil || req.URL == nil {
+		return ""
+	}
+	return req.URL.Path
+}
+
+func mapKeys(m map[string]bool) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k, ok := range m {
+		if ok {
+			keys = append(keys, k)
+		}
+	}
+	return keys
 }
