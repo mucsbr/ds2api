@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"ds2api/internal/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 )
 
@@ -81,6 +82,13 @@ func (w *OpenAIStreamTranslatorWriter) Write(p []byte) (int, error) {
 			continue
 		}
 		usage, hasUsage := extractOpenAIUsage(trimmed)
+		if hasUsage {
+			config.Logger.Info("[claude_stream] extracted OpenAI usage from stream chunk",
+				"prompt_tokens", usage.PromptTokens,
+				"completion_tokens", usage.CompletionTokens,
+				"total_tokens", usage.TotalTokens,
+			)
+		}
 		chunks := sdktranslator.TranslateStream(context.Background(), sdktranslator.FormatOpenAI, w.target, w.model, w.originalReq, w.translatedReq, trimmed, &w.param)
 		if hasUsage {
 			for i := range chunks {
@@ -90,6 +98,13 @@ func (w *OpenAIStreamTranslatorWriter) Write(p []byte) (int, error) {
 		for i := range chunks {
 			if len(chunks[i]) == 0 {
 				continue
+			}
+			// Log Claude SSE events that contain input_tokens/output_tokens for debugging
+			if w.target == sdktranslator.FormatClaude {
+				chunkStr := string(chunks[i])
+				if strings.Contains(chunkStr, "message_start") || strings.Contains(chunkStr, "message_delta") {
+					config.Logger.Info("[claude_stream] emitting Claude SSE event", "event_text", strings.TrimSpace(chunkStr))
+				}
 			}
 			if _, err := w.dst.Write(chunks[i]); err != nil {
 				return len(p), err

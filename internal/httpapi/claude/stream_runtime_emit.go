@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"ds2api/internal/config"
 	"ds2api/internal/util"
 )
 
@@ -43,6 +44,11 @@ func (s *claudeStreamRuntime) sendPing() {
 
 func (s *claudeStreamRuntime) sendMessageStart() {
 	inputTokens := util.EstimateTokens(fmt.Sprintf("%v", s.messages))
+	config.Logger.Info("[claude_stream_direct] sending message_start with estimated input_tokens",
+		"input_tokens", inputTokens,
+		"message_count", len(s.messages),
+		"message_id", s.messageID,
+	)
 	s.send("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{

@@ -5,10 +5,12 @@ import (
 	"net/http"
 	"strings"
 
+	"ds2api/internal/config"
 	openaifmt "ds2api/internal/format/openai"
 	"ds2api/internal/sse"
 	streamengine "ds2api/internal/stream"
 	"ds2api/internal/toolstream"
+	"ds2api/internal/util"
 )
 
 type chatStreamRuntime struct {
@@ -47,6 +49,8 @@ type chatStreamRuntime struct {
 	finalErrorStatus  int
 	finalErrorMessage string
 	finalErrorCode    string
+
+	upstreamAccumulatedTokens int // upstream DeepSeek accumulated_token_usage, represents total tokens consumed
 }
 
 func newChatStreamRuntime(
@@ -217,7 +221,14 @@ func (s *chatStreamRuntime) finalize(finishReason string, deferEmptyOutput bool)
 		s.sendFailedChunk(status, message, code)
 		return true
 	}
-	usage := openaifmt.BuildChatUsage(s.finalPrompt, finalThinking, finalText)
+	usage := buildChatUsageWithUpstream(s.upstreamAccumulatedTokens, s.finalPrompt, finalThinking, finalText)
+	config.Logger.Info("[openai_chat_stream] finalize sending chunk with usage",
+		"model", s.model,
+		"prompt_tokens", usage["prompt_tokens"],
+		"completion_tokens", usage["completion_tokens"],
+		"total_tokens", usage["total_tokens"],
+		"final_prompt_len", len(s.finalPrompt),
+	)
 	s.finalFinishReason = finishReason
 	s.finalUsage = usage
 	s.sendChunk(openaifmt.BuildChatStreamChunk(
@@ -237,6 +248,9 @@ func (s *chatStreamRuntime) onParsed(parsed sse.LineResult) streamengine.ParsedD
 	}
 	if parsed.ResponseMessageID > 0 {
 		s.responseMessageID = parsed.ResponseMessageID
+	}
+	if parsed.AccumulatedTokens > 0 {
+		s.upstreamAccumulatedTokens = parsed.AccumulatedTokens
 	}
 	if parsed.ContentFilter {
 		if strings.TrimSpace(s.text.String()) == "" {
@@ -356,4 +370,41 @@ func (s *chatStreamRuntime) onParsed(parsed sse.LineResult) streamengine.ParsedD
 		s.sendChunk(openaifmt.BuildChatStreamChunk(s.completionID, s.created, s.model, newChoices, nil))
 	}
 	return streamengine.ParsedDecision{ContentSeen: contentSeen}
+}
+
+// buildChatUsageWithUpstream builds usage using upstream DeepSeek accumulated_token_usage for prompt_tokens.
+// upstreamTotal is the total accumulated token count from DeepSeek SSE (includes both prompt and completion).
+// We subtract locally estimated completion tokens to get the real prompt token count.
+func buildChatUsageWithUpstream(upstreamTotal int, finalPrompt, finalThinking, finalText string) map[string]any {
+	reasoningTokens := util.EstimateTokens(finalThinking)
+	completionTokens := util.EstimateTokens(finalText)
+	totalCompletion := reasoningTokens + completionTokens
+
+	var promptTokens int
+	if upstreamTotal > 0 && upstreamTotal > totalCompletion {
+		promptTokens = upstreamTotal - totalCompletion
+		config.Logger.Info("[openai_chat_stream] using upstream DeepSeek token count for prompt_tokens",
+			"upstream_total", upstreamTotal,
+			"local_completion", totalCompletion,
+			"prompt_tokens", promptTokens,
+		)
+	} else {
+		// Fallback to local estimation when upstream data is unavailable
+		promptTokens = util.EstimateTokens(finalPrompt)
+		config.Logger.Info("[openai_chat_stream] upstream token data unavailable, falling back to local estimation",
+			"upstream_total", upstreamTotal,
+			"local_completion", totalCompletion,
+			"estimated_prompt_tokens", promptTokens,
+			"final_prompt_len", len(finalPrompt),
+		)
+	}
+
+	return map[string]any{
+		"prompt_tokens":     promptTokens,
+		"completion_tokens": totalCompletion,
+		"total_tokens":      promptTokens + totalCompletion,
+		"completion_tokens_details": map[string]any{
+			"reasoning_tokens": reasoningTokens,
+		},
+	}
 }
