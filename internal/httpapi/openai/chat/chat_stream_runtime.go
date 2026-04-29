@@ -23,6 +23,7 @@ type chatStreamRuntime struct {
 	model        string
 	finalPrompt  string
 	toolNames    []string
+	toolsRaw     any
 
 	thinkingEnabled       bool
 	searchEnabled         bool
@@ -65,6 +66,7 @@ func newChatStreamRuntime(
 	searchEnabled bool,
 	stripReferenceMarkers bool,
 	toolNames []string,
+	toolsRaw any,
 	bufferToolContent bool,
 	emitEarlyToolDeltas bool,
 ) *chatStreamRuntime {
@@ -77,6 +79,7 @@ func newChatStreamRuntime(
 		model:                 model,
 		finalPrompt:           finalPrompt,
 		toolNames:             toolNames,
+		toolsRaw:              toolsRaw,
 		thinkingEnabled:       thinkingEnabled,
 		searchEnabled:         searchEnabled,
 		stripReferenceMarkers: stripReferenceMarkers,
@@ -146,7 +149,7 @@ func (s *chatStreamRuntime) finalize(finishReason string, deferEmptyOutput bool)
 	if len(detected.Calls) > 0 && !s.toolCallsDoneEmitted {
 		finishReason = "tool_calls"
 		delta := map[string]any{
-			"tool_calls": formatFinalStreamToolCallsWithStableIDs(detected.Calls, s.streamToolCallIDs),
+			"tool_calls": formatFinalStreamToolCallsWithStableIDs(detected.Calls, s.streamToolCallIDs, s.toolsRaw),
 		}
 		if !s.firstChunkSent {
 			delta["role"] = "assistant"
@@ -168,7 +171,7 @@ func (s *chatStreamRuntime) finalize(finishReason string, deferEmptyOutput bool)
 				s.toolCallsEmitted = true
 				s.toolCallsDoneEmitted = true
 				tcDelta := map[string]any{
-					"tool_calls": formatFinalStreamToolCallsWithStableIDs(evt.ToolCalls, s.streamToolCallIDs),
+					"tool_calls": formatFinalStreamToolCallsWithStableIDs(evt.ToolCalls, s.streamToolCallIDs, s.toolsRaw),
 				}
 				if !s.firstChunkSent {
 					tcDelta["role"] = "assistant"
@@ -334,7 +337,7 @@ func (s *chatStreamRuntime) onParsed(parsed sse.LineResult) streamengine.ParsedD
 						s.toolCallsEmitted = true
 						s.toolCallsDoneEmitted = true
 						tcDelta := map[string]any{
-							"tool_calls": formatFinalStreamToolCallsWithStableIDs(evt.ToolCalls, s.streamToolCallIDs),
+							"tool_calls": formatFinalStreamToolCallsWithStableIDs(evt.ToolCalls, s.streamToolCallIDs, s.toolsRaw),
 						}
 						if !s.firstChunkSent {
 							tcDelta["role"] = "assistant"
