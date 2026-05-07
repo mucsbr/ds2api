@@ -5,12 +5,13 @@ import (
 	"net/http"
 	"strings"
 
-	"ds2api/internal/config"
+	"ds2api/internal/assistantturn"
 	openaifmt "ds2api/internal/format/openai"
+	"ds2api/internal/httpapi/openai/shared"
+	"ds2api/internal/promptcompat"
 	"ds2api/internal/sse"
 	streamengine "ds2api/internal/stream"
 	"ds2api/internal/toolstream"
-	"ds2api/internal/util"
 )
 
 type chatStreamRuntime struct {
@@ -18,12 +19,14 @@ type chatStreamRuntime struct {
 	rc       *http.ResponseController
 	canFlush bool
 
-	completionID string
-	created      int64
-	model        string
-	finalPrompt  string
-	toolNames    []string
-	toolsRaw     any
+	completionID  string
+	created       int64
+	model         string
+	finalPrompt   string
+	refFileTokens int
+	toolNames     []string
+	toolsRaw      any
+	toolChoice    promptcompat.ToolChoicePolicy
 
 	thinkingEnabled       bool
 	searchEnabled         bool
@@ -35,15 +38,11 @@ type chatStreamRuntime struct {
 	toolCallsEmitted     bool
 	toolCallsDoneEmitted bool
 
-	toolSieve             toolstream.State
-	streamToolCallIDs     map[int]string
-	streamToolNames       map[int]string
-	rawThinking           strings.Builder
-	thinking              strings.Builder
-	toolDetectionThinking strings.Builder
-	rawText               strings.Builder
-	text                  strings.Builder
-	responseMessageID     int
+	toolSieve         toolstream.State
+	streamToolCallIDs map[int]string
+	streamToolNames   map[int]string
+	accumulator       shared.StreamAccumulator
+	responseMessageID int
 
 	finalThinking     string
 	finalText         string
@@ -52,8 +51,32 @@ type chatStreamRuntime struct {
 	finalErrorStatus  int
 	finalErrorMessage string
 	finalErrorCode    string
+}
 
-	upstreamAccumulatedTokens int // upstream DeepSeek accumulated_token_usage, represents total tokens consumed
+type chatDeltaBatch struct {
+	runtime *chatStreamRuntime
+	field   string
+	text    strings.Builder
+}
+
+func (b *chatDeltaBatch) append(field, text string) {
+	if text == "" {
+		return
+	}
+	if b.field != "" && b.field != field {
+		b.flush()
+	}
+	b.field = field
+	b.text.WriteString(text)
+}
+
+func (b *chatDeltaBatch) flush() {
+	if b.field == "" || b.text.Len() == 0 {
+		return
+	}
+	b.runtime.sendDelta(map[string]any{b.field: b.text.String()})
+	b.field = ""
+	b.text.Reset()
 }
 
 func newChatStreamRuntime(
@@ -69,6 +92,7 @@ func newChatStreamRuntime(
 	stripReferenceMarkers bool,
 	toolNames []string,
 	toolsRaw any,
+	toolChoice promptcompat.ToolChoicePolicy,
 	bufferToolContent bool,
 	emitEarlyToolDeltas bool,
 ) *chatStreamRuntime {
@@ -82,6 +106,7 @@ func newChatStreamRuntime(
 		finalPrompt:           finalPrompt,
 		toolNames:             toolNames,
 		toolsRaw:              toolsRaw,
+		toolChoice:            toolChoice,
 		thinkingEnabled:       thinkingEnabled,
 		searchEnabled:         searchEnabled,
 		stripReferenceMarkers: stripReferenceMarkers,
@@ -89,6 +114,11 @@ func newChatStreamRuntime(
 		emitEarlyToolDeltas:   emitEarlyToolDeltas,
 		streamToolCallIDs:     map[int]string{},
 		streamToolNames:       map[int]string{},
+		accumulator: shared.StreamAccumulator{
+			ThinkingEnabled:       thinkingEnabled,
+			SearchEnabled:         searchEnabled,
+			StripReferenceMarkers: stripReferenceMarkers,
+		},
 	}
 }
 
@@ -108,6 +138,23 @@ func (s *chatStreamRuntime) sendChunk(v any) {
 	if s.canFlush {
 		_ = s.rc.Flush()
 	}
+}
+
+func (s *chatStreamRuntime) sendDelta(delta map[string]any) {
+	if len(delta) == 0 {
+		return
+	}
+	if !s.firstChunkSent {
+		delta["role"] = "assistant"
+		s.firstChunkSent = true
+	}
+	s.sendChunk(openaifmt.BuildChatStreamChunk(
+		s.completionID,
+		s.created,
+		s.model,
+		[]map[string]any{openaifmt.BuildChatStreamDeltaChoice(0, delta)},
+		nil,
+	))
 }
 
 func (s *chatStreamRuntime) sendDone() {
@@ -133,6 +180,33 @@ func (s *chatStreamRuntime) sendFailedChunk(status int, message, code string) {
 	s.sendDone()
 }
 
+func (s *chatStreamRuntime) markContextCancelled() {
+	s.finalErrorStatus = 499
+	s.finalErrorMessage = "request context cancelled"
+	s.finalErrorCode = string(streamengine.StopReasonContextCancelled)
+	s.finalThinking = s.accumulator.Thinking.String()
+	s.finalText = cleanVisibleOutput(s.accumulator.Text.String(), s.stripReferenceMarkers)
+	s.finalFinishReason = string(streamengine.StopReasonContextCancelled)
+}
+
+func (s *chatStreamRuntime) historyText() string {
+	if s == nil {
+		return ""
+	}
+	return historyTextForArchive(s.accumulator.RawText.String(), s.finalText)
+}
+
+func (s *chatStreamRuntime) historyThinking() string {
+	if s == nil {
+		return ""
+	}
+	return historyThinkingForArchive(
+		s.accumulator.RawThinking.String(),
+		s.accumulator.ToolDetectionThinking.String(),
+		s.finalThinking,
+	)
+}
+
 func (s *chatStreamRuntime) resetStreamToolCallState() {
 	s.streamToolCallIDs = map[int]string{}
 	s.streamToolNames = map[int]string{}
@@ -142,50 +216,47 @@ func (s *chatStreamRuntime) finalize(finishReason string, deferEmptyOutput bool)
 	s.finalErrorStatus = 0
 	s.finalErrorMessage = ""
 	s.finalErrorCode = ""
-	finalThinking := s.thinking.String()
-	finalToolDetectionThinking := s.toolDetectionThinking.String()
-	finalText := cleanVisibleOutput(s.text.String(), s.stripReferenceMarkers)
-	s.finalThinking = finalThinking
-	s.finalText = finalText
-	detected := detectAssistantToolCalls(s.rawText.String(), finalText, s.rawThinking.String(), finalToolDetectionThinking, s.toolNames)
-	if len(detected.Calls) > 0 && !s.toolCallsDoneEmitted {
-		finishReason = "tool_calls"
-		delta := map[string]any{
-			"tool_calls": formatFinalStreamToolCallsWithStableIDs(detected.Calls, s.streamToolCallIDs, s.toolsRaw),
-		}
-		if !s.firstChunkSent {
-			delta["role"] = "assistant"
-			s.firstChunkSent = true
-		}
-		s.sendChunk(openaifmt.BuildChatStreamChunk(
-			s.completionID,
-			s.created,
-			s.model,
-			[]map[string]any{openaifmt.BuildChatStreamDeltaChoice(0, delta)},
-			nil,
-		))
+	finalThinking := s.accumulator.Thinking.String()
+	finalToolDetectionThinking := s.accumulator.ToolDetectionThinking.String()
+	finalText := s.accumulator.Text.String()
+	turn := assistantturn.BuildTurnFromStreamSnapshot(assistantturn.StreamSnapshot{
+		RawText:               s.accumulator.RawText.String(),
+		VisibleText:           finalText,
+		RawThinking:           s.accumulator.RawThinking.String(),
+		VisibleThinking:       finalThinking,
+		DetectionThinking:     finalToolDetectionThinking,
+		ContentFilter:         finishReason == "content_filter",
+		ResponseMessageID:     s.responseMessageID,
+		AlreadyEmittedCalls:   s.toolCallsEmitted,
+		AlreadyEmittedToolRaw: s.toolCallsDoneEmitted,
+	}, assistantturn.BuildOptions{
+		Model:                 s.model,
+		Prompt:                s.finalPrompt,
+		RefFileTokens:         s.refFileTokens,
+		SearchEnabled:         s.searchEnabled,
+		StripReferenceMarkers: s.stripReferenceMarkers,
+		ToolNames:             s.toolNames,
+		ToolsRaw:              s.toolsRaw,
+		ToolChoice:            s.toolChoice,
+	})
+	s.finalThinking = turn.Thinking
+	s.finalText = turn.Text
+	if len(turn.ToolCalls) > 0 && !s.toolCallsDoneEmitted {
+		s.sendDelta(map[string]any{
+			"tool_calls": formatFinalStreamToolCallsWithStableIDs(turn.ToolCalls, s.streamToolCallIDs, s.toolsRaw),
+		})
 		s.toolCallsEmitted = true
 		s.toolCallsDoneEmitted = true
 	} else if s.bufferToolContent {
+		batch := chatDeltaBatch{runtime: s}
 		for _, evt := range toolstream.Flush(&s.toolSieve, s.toolNames) {
 			if len(evt.ToolCalls) > 0 {
-				finishReason = "tool_calls"
+				batch.flush()
 				s.toolCallsEmitted = true
 				s.toolCallsDoneEmitted = true
-				tcDelta := map[string]any{
+				s.sendDelta(map[string]any{
 					"tool_calls": formatFinalStreamToolCallsWithStableIDs(evt.ToolCalls, s.streamToolCallIDs, s.toolsRaw),
-				}
-				if !s.firstChunkSent {
-					tcDelta["role"] = "assistant"
-					s.firstChunkSent = true
-				}
-				s.sendChunk(openaifmt.BuildChatStreamChunk(
-					s.completionID,
-					s.created,
-					s.model,
-					[]map[string]any{openaifmt.BuildChatStreamDeltaChoice(0, tcDelta)},
-					nil,
-				))
+				})
 				s.resetStreamToolCallState()
 			}
 			if evt.Content == "" {
@@ -195,28 +266,16 @@ func (s *chatStreamRuntime) finalize(finishReason string, deferEmptyOutput bool)
 			if cleaned == "" || (s.searchEnabled && sse.IsCitation(cleaned)) {
 				continue
 			}
-			delta := map[string]any{
-				"content": cleaned,
-			}
-			if !s.firstChunkSent {
-				delta["role"] = "assistant"
-				s.firstChunkSent = true
-			}
-			s.sendChunk(openaifmt.BuildChatStreamChunk(
-				s.completionID,
-				s.created,
-				s.model,
-				[]map[string]any{openaifmt.BuildChatStreamDeltaChoice(0, delta)},
-				nil,
-			))
+			batch.append("content", cleaned)
 		}
+		batch.flush()
 	}
 
-	if len(detected.Calls) > 0 || s.toolCallsEmitted {
-		finishReason = "tool_calls"
-	}
-	if len(detected.Calls) == 0 && !s.toolCallsEmitted && strings.TrimSpace(finalText) == "" {
-		status, message, code := upstreamEmptyOutputDetail(finishReason == "content_filter", finalText, finalThinking)
+	outcome := assistantturn.FinalizeTurn(turn, assistantturn.FinalizeOptions{
+		AlreadyEmittedToolCalls: s.toolCallsEmitted || s.toolCallsDoneEmitted,
+	})
+	if outcome.ShouldFail {
+		status, message, code := outcome.Error.Status, outcome.Error.Message, outcome.Error.Code
 		if deferEmptyOutput {
 			s.finalErrorStatus = status
 			s.finalErrorMessage = message
@@ -226,21 +285,14 @@ func (s *chatStreamRuntime) finalize(finishReason string, deferEmptyOutput bool)
 		s.sendFailedChunk(status, message, code)
 		return true
 	}
-	usage := buildChatUsageWithUpstream(s.upstreamAccumulatedTokens, s.finalPrompt, finalThinking, finalText)
-	config.Logger.Info("[openai_chat_stream] finalize sending chunk with usage",
-		"model", s.model,
-		"prompt_tokens", usage["prompt_tokens"],
-		"completion_tokens", usage["completion_tokens"],
-		"total_tokens", usage["total_tokens"],
-		"final_prompt_len", len(s.finalPrompt),
-	)
-	s.finalFinishReason = finishReason
+	usage := assistantturn.OpenAIChatUsage(turn)
+	s.finalFinishReason = outcome.FinishReason
 	s.finalUsage = usage
 	s.sendChunk(openaifmt.BuildChatStreamChunk(
 		s.completionID,
 		s.created,
 		s.model,
-		[]map[string]any{openaifmt.BuildChatStreamFinishChoice(0, finishReason)},
+		[]map[string]any{openaifmt.BuildChatStreamFinishChoice(0, outcome.FinishReason)},
 		usage,
 	))
 	s.sendDone()
@@ -254,11 +306,8 @@ func (s *chatStreamRuntime) onParsed(parsed sse.LineResult) streamengine.ParsedD
 	if parsed.ResponseMessageID > 0 {
 		s.responseMessageID = parsed.ResponseMessageID
 	}
-	if parsed.AccumulatedTokens > 0 {
-		s.upstreamAccumulatedTokens = parsed.AccumulatedTokens
-	}
 	if parsed.ContentFilter {
-		if strings.TrimSpace(s.text.String()) == "" {
+		if strings.TrimSpace(s.accumulator.Text.String()) == "" {
 			return streamengine.ParsedDecision{Stop: true, StopReason: streamengine.StopReason("content_filter")}
 		}
 		return streamengine.ParsedDecision{Stop: true, StopReason: streamengine.StopReasonHandlerRequested}
@@ -270,159 +319,65 @@ func (s *chatStreamRuntime) onParsed(parsed sse.LineResult) streamengine.ParsedD
 		return streamengine.ParsedDecision{Stop: true, StopReason: streamengine.StopReasonHandlerRequested}
 	}
 
-	newChoices := make([]map[string]any, 0, len(parsed.Parts))
-	contentSeen := false
-	for _, p := range parsed.ToolDetectionThinkingParts {
-		trimmed := sse.TrimContinuationOverlap(s.toolDetectionThinking.String(), p.Text)
-		if trimmed != "" {
-			s.toolDetectionThinking.WriteString(trimmed)
-		}
-	}
-	for _, p := range parsed.Parts {
-		delta := map[string]any{}
-		if !s.firstChunkSent {
-			delta["role"] = "assistant"
-			s.firstChunkSent = true
-		}
+	batch := chatDeltaBatch{runtime: s}
+	accumulated := s.accumulator.Apply(parsed)
+	for _, p := range accumulated.Parts {
 		if p.Type == "thinking" {
-			rawTrimmed := sse.TrimContinuationOverlap(s.rawThinking.String(), p.Text)
-			if rawTrimmed != "" {
-				s.rawThinking.WriteString(rawTrimmed)
-				contentSeen = true
-			}
-			if s.thinkingEnabled {
-				cleanedText := cleanVisibleOutput(rawTrimmed, s.stripReferenceMarkers)
-				if cleanedText == "" {
-					continue
-				}
-				trimmed := sse.TrimContinuationOverlap(s.thinking.String(), cleanedText)
-				if trimmed == "" {
-					continue
-				}
-				s.thinking.WriteString(trimmed)
-				delta["reasoning_content"] = trimmed
-			}
+			batch.append("reasoning_content", p.VisibleText)
+			continue
+		}
+		if p.RawText == "" {
+			continue
+		}
+		if p.CitationOnly {
+			continue
+		}
+		if !s.bufferToolContent {
+			batch.append("content", p.VisibleText)
 		} else {
-			rawTrimmed := sse.TrimContinuationOverlap(s.rawText.String(), p.Text)
-			if rawTrimmed == "" {
-				continue
-			}
-			s.rawText.WriteString(rawTrimmed)
-			contentSeen = true
-			cleanedText := cleanVisibleOutput(rawTrimmed, s.stripReferenceMarkers)
-			if s.searchEnabled && sse.IsCitation(cleanedText) {
-				continue
-			}
-			trimmed := sse.TrimContinuationOverlap(s.text.String(), cleanedText)
-			if trimmed != "" {
-				s.text.WriteString(trimmed)
-			}
-			if !s.bufferToolContent {
-				if trimmed == "" {
+			events := toolstream.ProcessChunk(&s.toolSieve, p.RawText, s.toolNames)
+			for _, evt := range events {
+				if len(evt.ToolCallDeltas) > 0 {
+					if !s.emitEarlyToolDeltas {
+						continue
+					}
+					filtered := filterIncrementalToolCallDeltasByAllowed(evt.ToolCallDeltas, s.streamToolNames)
+					if len(filtered) == 0 {
+						continue
+					}
+					formatted := formatIncrementalStreamToolCallDeltas(filtered, s.streamToolCallIDs)
+					if len(formatted) == 0 {
+						continue
+					}
+					batch.flush()
+					tcDelta := map[string]any{
+						"tool_calls": formatted,
+					}
+					s.toolCallsEmitted = true
+					s.sendDelta(tcDelta)
 					continue
 				}
-				delta["content"] = trimmed
-			} else {
-				events := toolstream.ProcessChunk(&s.toolSieve, rawTrimmed, s.toolNames)
-				for _, evt := range events {
-					if len(evt.ToolCallDeltas) > 0 {
-						if !s.emitEarlyToolDeltas {
-							continue
-						}
-						filtered := filterIncrementalToolCallDeltasByAllowed(evt.ToolCallDeltas, s.streamToolNames)
-						if len(filtered) == 0 {
-							continue
-						}
-						formatted := formatIncrementalStreamToolCallDeltas(filtered, s.streamToolCallIDs)
-						if len(formatted) == 0 {
-							continue
-						}
-						tcDelta := map[string]any{
-							"tool_calls": formatted,
-						}
-						s.toolCallsEmitted = true
-						if !s.firstChunkSent {
-							tcDelta["role"] = "assistant"
-							s.firstChunkSent = true
-						}
-						newChoices = append(newChoices, openaifmt.BuildChatStreamDeltaChoice(0, tcDelta))
+				if len(evt.ToolCalls) > 0 {
+					batch.flush()
+					s.toolCallsEmitted = true
+					s.toolCallsDoneEmitted = true
+					tcDelta := map[string]any{
+						"tool_calls": formatFinalStreamToolCallsWithStableIDs(evt.ToolCalls, s.streamToolCallIDs, s.toolsRaw),
+					}
+					s.sendDelta(tcDelta)
+					s.resetStreamToolCallState()
+					continue
+				}
+				if evt.Content != "" {
+					cleaned := cleanVisibleOutput(evt.Content, s.stripReferenceMarkers)
+					if cleaned == "" || (s.searchEnabled && sse.IsCitation(cleaned)) {
 						continue
 					}
-					if len(evt.ToolCalls) > 0 {
-						s.toolCallsEmitted = true
-						s.toolCallsDoneEmitted = true
-						tcDelta := map[string]any{
-							"tool_calls": formatFinalStreamToolCallsWithStableIDs(evt.ToolCalls, s.streamToolCallIDs, s.toolsRaw),
-						}
-						if !s.firstChunkSent {
-							tcDelta["role"] = "assistant"
-							s.firstChunkSent = true
-						}
-						newChoices = append(newChoices, openaifmt.BuildChatStreamDeltaChoice(0, tcDelta))
-						s.resetStreamToolCallState()
-						continue
-					}
-					if evt.Content != "" {
-						cleaned := cleanVisibleOutput(evt.Content, s.stripReferenceMarkers)
-						if cleaned == "" || (s.searchEnabled && sse.IsCitation(cleaned)) {
-							continue
-						}
-						contentDelta := map[string]any{
-							"content": cleaned,
-						}
-						if !s.firstChunkSent {
-							contentDelta["role"] = "assistant"
-							s.firstChunkSent = true
-						}
-						newChoices = append(newChoices, openaifmt.BuildChatStreamDeltaChoice(0, contentDelta))
-					}
+					batch.append("content", cleaned)
 				}
 			}
 		}
-		if len(delta) > 0 {
-			newChoices = append(newChoices, openaifmt.BuildChatStreamDeltaChoice(0, delta))
-		}
 	}
-
-	if len(newChoices) > 0 {
-		s.sendChunk(openaifmt.BuildChatStreamChunk(s.completionID, s.created, s.model, newChoices, nil))
-	}
-	return streamengine.ParsedDecision{ContentSeen: contentSeen}
-}
-
-// buildChatUsageWithUpstream builds usage using upstream DeepSeek accumulated_token_usage for prompt_tokens.
-// upstreamTotal is the total accumulated token count from DeepSeek SSE (includes both prompt and completion).
-// We subtract locally estimated completion tokens to get the real prompt token count.
-func buildChatUsageWithUpstream(upstreamTotal int, finalPrompt, finalThinking, finalText string) map[string]any {
-	reasoningTokens := util.EstimateTokens(finalThinking)
-	completionTokens := util.EstimateTokens(finalText)
-	totalCompletion := reasoningTokens + completionTokens
-
-	var promptTokens int
-	if upstreamTotal > 0 && upstreamTotal > totalCompletion {
-		promptTokens = upstreamTotal - totalCompletion
-		config.Logger.Info("[openai_chat_stream] using upstream DeepSeek token count for prompt_tokens",
-			"upstream_total", upstreamTotal,
-			"local_completion", totalCompletion,
-			"prompt_tokens", promptTokens,
-		)
-	} else {
-		// Fallback to local estimation when upstream data is unavailable
-		promptTokens = util.EstimateTokens(finalPrompt)
-		config.Logger.Info("[openai_chat_stream] upstream token data unavailable, falling back to local estimation",
-			"upstream_total", upstreamTotal,
-			"local_completion", totalCompletion,
-			"estimated_prompt_tokens", promptTokens,
-			"final_prompt_len", len(finalPrompt),
-		)
-	}
-
-	return map[string]any{
-		"prompt_tokens":     promptTokens,
-		"completion_tokens": totalCompletion,
-		"total_tokens":      promptTokens + totalCompletion,
-		"completion_tokens_details": map[string]any{
-			"reasoning_tokens": reasoningTokens,
-		},
-	}
+	batch.flush()
+	return streamengine.ParsedDecision{ContentSeen: accumulated.ContentSeen}
 }

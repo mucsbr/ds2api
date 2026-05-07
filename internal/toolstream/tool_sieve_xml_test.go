@@ -72,6 +72,97 @@ func TestProcessToolSieveInterceptsDSMLToolCallWithoutLeak(t *testing.T) {
 	}
 }
 
+func TestProcessToolSieveInterceptsDSMLTrailingPipeToolCallWithoutLeak(t *testing.T) {
+	var state State
+	chunks := []string{
+		"<|DSML|tool_calls| \n",
+		`  <|DSML|invoke name="terminal">` + "\n",
+		`    <|DSML|parameter name="command"><![CDATA[find "/home" -type d]]></|DSML|parameter>` + "\n",
+		`    <|DSML|parameter name="timeout"><![CDATA[10]]></|DSML|parameter>` + "\n",
+		"  </|DSML|invoke>\n",
+		"</|DSML|tool_calls>",
+	}
+	var events []Event
+	for _, c := range chunks {
+		events = append(events, ProcessChunk(&state, c, []string{"terminal"})...)
+	}
+	events = append(events, Flush(&state, []string{"terminal"})...)
+
+	var textContent strings.Builder
+	var calls []any
+	for _, evt := range events {
+		textContent.WriteString(evt.Content)
+		for _, call := range evt.ToolCalls {
+			calls = append(calls, call)
+		}
+	}
+	if text := textContent.String(); strings.Contains(strings.ToLower(text), "dsml") || strings.Contains(text, "terminal") {
+		t.Fatalf("trailing-pipe DSML tool call leaked to text: %q events=%#v", text, events)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("expected one trailing-pipe DSML tool call, got %d events=%#v", len(calls), events)
+	}
+}
+
+func TestProcessToolSieveInterceptsExtraLeadingLessThanDSMLToolCallWithoutLeak(t *testing.T) {
+	var state State
+	chunks := []string{
+		"<<|DSML|tool_calls>\n",
+		`  <<|DSML|invoke name="Bash">` + "\n",
+		`    <<|DSML|parameter name="command"><![CDATA[pwd]]></|DSML|parameter>` + "\n",
+		"  </|DSML|invoke>\n",
+		"</|DSML|tool_calls>",
+	}
+	var events []Event
+	for _, c := range chunks {
+		events = append(events, ProcessChunk(&state, c, []string{"Bash"})...)
+	}
+	events = append(events, Flush(&state, []string{"Bash"})...)
+
+	var textContent strings.Builder
+	toolCalls := 0
+	for _, evt := range events {
+		textContent.WriteString(evt.Content)
+		toolCalls += len(evt.ToolCalls)
+	}
+	if text := textContent.String(); strings.Contains(text, "<") || strings.Contains(text, "Bash") {
+		t.Fatalf("extra-leading-less-than DSML tool call leaked to text: %q events=%#v", text, events)
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected one extra-leading-less-than DSML tool call, got %d events=%#v", toolCalls, events)
+	}
+}
+
+func TestProcessToolSieveInterceptsRepeatedDSMLPrefixNoiseWithoutLeak(t *testing.T) {
+	var state State
+	chunks := []string{
+		"<<DSML|DSML|tool",
+		"_calls>\n",
+		`  <<DSML|DSML|invoke name="Bash">` + "\n",
+		`    <<DSML|DSML|parameter name="command"><![CDATA[git status]]></DSML|DSML|parameter>` + "\n",
+		"  </DSML|DSML|invoke>\n",
+		"</DSML|DSML|tool_calls>",
+	}
+	var events []Event
+	for _, c := range chunks {
+		events = append(events, ProcessChunk(&state, c, []string{"Bash"})...)
+	}
+	events = append(events, Flush(&state, []string{"Bash"})...)
+
+	var textContent strings.Builder
+	toolCalls := 0
+	for _, evt := range events {
+		textContent.WriteString(evt.Content)
+		toolCalls += len(evt.ToolCalls)
+	}
+	if text := textContent.String(); strings.Contains(strings.ToLower(text), "dsml") || strings.Contains(text, "Bash") {
+		t.Fatalf("repeated-prefix DSML tool call leaked to text: %q events=%#v", text, events)
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected one repeated-prefix DSML tool call, got %d events=%#v", toolCalls, events)
+	}
+}
+
 func TestProcessToolSieveHandlesLongXMLToolCall(t *testing.T) {
 	var state State
 	const toolName = "write_to_file"
@@ -171,6 +262,117 @@ func TestProcessToolSieveKeepsCDATAEmbeddedToolClosingBuffered(t *testing.T) {
 	}
 	if gotPayload != payload {
 		t.Fatalf("expected full CDATA payload to survive intact, got len=%d want=%d", len(gotPayload), len(payload))
+	}
+}
+
+func TestProcessToolSieveKeepsExtremeHereDocCDATAUntilOuterClose(t *testing.T) {
+	var state State
+	command := strings.Join([]string{
+		"cat > docs/project-value.md << 'ENDOFFILE'",
+		"# DS2API project value",
+		"",
+		"```xml",
+		`<|DSML|tool_calls>`,
+		`  <|DSML|invoke name="Bash">`,
+		`    <|DSML|parameter name="command"><![CDATA[grep -E "error|fail" < input.log 2>&1]]></|DSML|parameter>`,
+		`  </|DSML|invoke>`,
+		`</|DSML|tool_calls>`,
+		"```",
+		"",
+		"Only the literal `]]>` needs special handling.",
+		"",
+		"ENDOFFILE",
+		`echo "Done. Lines: $(wc -l < docs/project-value.md)"`,
+	}, "\n")
+	innerClose := strings.Index(command, `</|DSML|tool_calls>`) + len(`</|DSML|tool_calls>`)
+	chunks := []string{
+		`<|DSML|tool_calls>` + "\n",
+		`<|DSML|invoke name="Bash">` + "\n",
+		`<|DSML|parameter name="command"><![CDATA[` + command[:innerClose],
+		command[innerClose:],
+		`]]></|DSML|parameter>` + "\n",
+		`<|DSML|parameter name="description"><![CDATA[Write project value doc]]></|DSML|parameter>` + "\n",
+		`</|DSML|invoke>` + "\n",
+		`</|DSML|tool_calls>`,
+	}
+
+	var events []Event
+	for i, c := range chunks {
+		next := ProcessChunk(&state, c, []string{"Bash"})
+		if i <= 2 {
+			for _, evt := range next {
+				if evt.Content != "" || len(evt.ToolCalls) > 0 {
+					t.Fatalf("expected no events before outer close, chunk=%d events=%#v", i, next)
+				}
+			}
+		}
+		events = append(events, next...)
+	}
+	events = append(events, Flush(&state, []string{"Bash"})...)
+
+	var textContent strings.Builder
+	var gotCommand string
+	toolCalls := 0
+	for _, evt := range events {
+		textContent.WriteString(evt.Content)
+		if len(evt.ToolCalls) > 0 {
+			toolCalls += len(evt.ToolCalls)
+			gotCommand, _ = evt.ToolCalls[0].Input["command"].(string)
+		}
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected one parsed tool call, got %d events=%#v", toolCalls, events)
+	}
+	if textContent.Len() != 0 {
+		t.Fatalf("expected no leaked text, got %q", textContent.String())
+	}
+	if gotCommand != command {
+		t.Fatalf("expected full heredoc command to survive, got len=%d want=%d", len(gotCommand), len(command))
+	}
+}
+
+func TestProcessToolSieveKeepsCompactCDATAWithImmediateFencedDSML(t *testing.T) {
+	var state State
+	content := strings.Join([]string{
+		"```xml",
+		`<|DSML|tool_calls>`,
+		`  <|DSML|invoke name="Bash">`,
+		`    <|DSML|parameter name="command"><![CDATA[echo compact]]></|DSML|parameter>`,
+		`  </|DSML|invoke>`,
+		`</|DSML|tool_calls>`,
+		"```",
+		"tail",
+	}, "\n")
+	chunks := []string{
+		`<tool_calls><invoke name="Write"><parameter name="content"><![CDATA[` + content[:len("```xml\n")],
+		content[len("```xml\n"):],
+		`]]></parameter></invoke></tool_calls>`,
+	}
+
+	var events []Event
+	for _, c := range chunks {
+		events = append(events, ProcessChunk(&state, c, []string{"Write"})...)
+	}
+	events = append(events, Flush(&state, []string{"Write"})...)
+
+	var textContent strings.Builder
+	var gotContent string
+	toolCalls := 0
+	for _, evt := range events {
+		textContent.WriteString(evt.Content)
+		if len(evt.ToolCalls) > 0 {
+			toolCalls += len(evt.ToolCalls)
+			gotContent, _ = evt.ToolCalls[0].Input["content"].(string)
+		}
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected one compact CDATA tool call, got %d events=%#v", toolCalls, events)
+	}
+	if textContent.Len() != 0 {
+		t.Fatalf("expected no leaked text, got %q", textContent.String())
+	}
+	if gotContent != content {
+		t.Fatalf("expected compact CDATA content to survive, got len=%d want=%d", len(gotContent), len(content))
 	}
 }
 
@@ -442,6 +644,8 @@ func TestFindToolSegmentStartDetectsXMLToolCalls(t *testing.T) {
 		want  int
 	}{
 		{"tool_calls_tag", "some text <tool_calls>\n", 10},
+		{"dsml_trailing_pipe_tag", "some text <|DSML|tool_calls| \n", 10},
+		{"dsml_extra_leading_less_than", "some text <<|DSML|tool_calls>\n", 10},
 		{"invoke_tag_missing_wrapper", "some text <invoke name=\"read_file\">\n", 10},
 		{"bare_tool_call_text", "prefix <tool_call>\n", -1},
 		{"xml_inside_code_fence", "```xml\n<tool_calls><invoke name=\"read_file\"></invoke></tool_calls>\n```", -1},
@@ -465,6 +669,8 @@ func TestFindPartialXMLToolTagStart(t *testing.T) {
 		want  int
 	}{
 		{"partial_tool_calls", "Hello <tool_ca", 6},
+		{"partial_dsml_trailing_pipe", "Hello <|DSML|tool_calls|", 6},
+		{"partial_dsml_extra_leading_less_than", "Hello <<|DSML|tool_calls", 6},
 		{"partial_invoke", "Hello <inv", 6},
 		{"bare_tool_call_not_held", "Hello <tool_name", -1},
 		{"partial_lt_only", "Text <", 5},

@@ -17,11 +17,21 @@
 
 语言 / Language: [中文](README.MD) | [English](README.en.md)
 
-将 DeepSeek Web 对话能力转换为 OpenAI、Claude 与 Gemini 兼容 API。后端为 **Go 全量实现**，前端为 React WebUI 管理台（源码在 `webui/`，部署时自动构建到 `static/admin`）。
+将 DeepSeek Web 对话能力转换为 OpenAI、Claude 与 Gemini 兼容 API。核心后端以 **Go** 实现，Vercel 流式桥接额外使用少量 Node Runtime，前端为 React WebUI 管理台（源码在 `webui/`，部署时自动构建到 `static/admin`）。
 
 文档入口：[文档导航](docs/README.md) / [架构说明](docs/ARCHITECTURE.md) / [接口文档](API.md)
 
 【感谢Linux.do社区及GitHub社区各位开发者对项目的支持与贡献】
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=cjackhwang%2Fds2api&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=cjackhwang/ds2api&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=cjackhwang/ds2api&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=cjackhwang/ds2api&type=date&legend=top-left" />
+ </picture>
+</a>
 
 > **重要免责声明**
 >
@@ -76,13 +86,14 @@ flowchart LR
 
         subgraph Runtime["运行时核心能力"]
             Compat["PromptCompat\n(API -> 网页纯文本上下文)"]
-            Chat["Chat / Responses Runtime\n(统一工具调用与流式语义)"]
+            Completion["Completion Runtime\n(Session / PoW / Completion)"]
+            Turn["AssistantTurn\n(输出语义归一)"]
             Auth["Auth Resolver\n(API key / bearer / x-goog-api-key)"]
             Pool["Account Pool + Queue\n(并发槽位 + 等待队列)"]
             DSClient["DeepSeek Client\n(Session / Auth / Completion / Files)"]
             Pow["PoW 实现\n(纯 Go)"]
             Tool["Tool Sieve\n(Go/Node 语义对齐)"]
-            History["History Split\n(长历史文件化)"]
+            History["Current Input File\n(DS2API_HISTORY.txt)"]
         end
     end
 
@@ -94,18 +105,19 @@ flowchart LR
 
     OA --> Compat
     CA & GA --> Compat
-    Compat --> Chat
-    Compat -.长历史.-> History
-    Vercel -.Go prepare.-> Chat
+    Compat --> Completion
+    Completion -.完整上下文.-> History
+    Completion --> Turn
+    Vercel -.Go prepare.-> Completion
     Vercel -.Node SSE.-> Tool
-    Chat --> Auth
-    Chat -.账号轮询.-> Pool
-    Chat -.工具调用解析.-> Tool
-    Chat -.PoW 计算.-> Pow
+    Completion --> Auth
+    Completion -.账号轮询.-> Pool
+    Completion -.工具调用解析.-> Tool
+    Completion -.PoW 计算.-> Pow
     Auth --> DSClient
     DSClient --> Upstream
     Upstream --> DSClient
-    Chat --> Client
+    Turn --> Client
     Vercel --> Client
 ```
 
@@ -119,7 +131,7 @@ flowchart LR
 
 | 能力 | 说明 |
 | --- | --- |
-| OpenAI 兼容 | `GET /v1/models`、`GET /v1/models/{id}`、`POST /v1/chat/completions`、`POST /v1/responses`、`GET /v1/responses/{response_id}`、`POST /v1/embeddings`、`POST /v1/files` |
+| OpenAI 兼容 | `GET /v1/models`、`GET /v1/models/{id}`、`POST /v1/chat/completions`、`POST /v1/responses`、`GET /v1/responses/{response_id}`、`POST /v1/embeddings`、`POST /v1/files`、`GET /v1/files/{file_id}` |
 | Claude 兼容 | `GET /anthropic/v1/models`、`POST /anthropic/v1/messages`、`POST /anthropic/v1/messages/count_tokens`（及快捷路径 `/v1/messages`、`/messages`） |
 | Gemini 兼容 | `POST /v1beta/models/{model}:generateContent`、`POST /v1beta/models/{model}:streamGenerateContent`（及 `/v1/models/{model}:*` 路径） |
 | 统一 CORS 兼容 | `/v1/*`、`/anthropic/*`、`/v1beta/models/*`、`/admin/*` 统一走同一套 CORS 策略；Vercel 上 `/v1/chat/completions` 的 Node Runtime 也对齐相同放行规则，尽量减少第三方预检请求头限制 |
@@ -130,6 +142,8 @@ flowchart LR
 | Admin API | 配置管理、运行时设置热更新、代理管理、账号测试 / 批量测试、会话清理、导入导出、Vercel 同步、版本检查 |
 | WebUI 管理台 | `/admin` 单页应用（中英文双语、深色模式，支持查看服务器端对话记录） |
 | 运维探针 | `GET /healthz`（存活）、`GET /readyz`（就绪） |
+
+OpenAI `/v1/*` 仍是推荐的规范路径；同时支持 `/models`、`/chat/completions`、`/responses`、`/embeddings`、`/files`、`/files/{file_id}` 等根路径快捷路由，方便只配置 DS2API 根地址的第三方客户端。
 
 ## 平台兼容矩阵
 
@@ -245,6 +259,7 @@ docker-compose logs -f
 
 默认 `docker-compose.yml` 会把宿主机 `6011` 映射到容器内的 `5001`。如果你希望直接对外暴露 `5001`，请设置 `DS2API_HOST_PORT=5001`（或者手动调整 `ports` 配置）。
 同时默认把 `./config.json` 挂载到容器 `/data/config.json`，并设置 `DS2API_CONFIG_PATH=/data/config.json`，用于避免 `/app` 只读导致运行时 token 持久化失败。
+镜像会预创建 `/data` 并授权给非 root 的 `ds2api` 用户；如果使用单文件 bind mount，请确保宿主机 `config.json` 对容器用户可读写，例如 `chmod 644 config.json`。
 
 更新镜像：`docker-compose up -d --build`
 
@@ -253,6 +268,10 @@ docker-compose logs -f
 1. 点击上方 “Deploy on Zeabur” 按钮，一键部署。
 2. 部署完成后访问 `/admin`，使用 Zeabur 环境变量/模板指引中的 `DS2API_ADMIN_KEY` 登录。
 3. 在管理台导入/编辑配置（会写入并持久化到 `/data/config.json`）。
+
+Zeabur 首次空卷启动时可以没有 `/data/config.json`；DS2API 会先使用空的文件模式配置启动，并在管理台首次保存时创建该文件。
+
+不依赖模板手动部署时，在 Zeabur 中选择 GitHub 仓库服务，Root Directory 保持 `/`，使用仓库根目录 `Dockerfile` 构建；添加持久卷 `/data`，设置 `PORT=5001`、`DS2API_ADMIN_KEY=你的强密钥`、`DS2API_CONFIG_PATH=/data/config.json`，然后暴露 HTTP 端口 `5001`。更完整步骤见 [docs/DEPLOY.md](docs/DEPLOY.md#不使用模板手动部署)。
 
 说明：Zeabur 使用仓库内 `Dockerfile` 直接构建时，不需要额外传入 `BUILD_VERSION`；镜像会优先读取该构建参数，未提供时自动回退到仓库根目录的 `VERSION` 文件。
 
@@ -282,7 +301,7 @@ base64 < config.json | tr -d '\n'
 
 ### 方式四：本地源码运行
 
-**前置要求**：Go 1.26+，Node.js `20.19+` 或 `22.12+`（仅在需要构建 WebUI 时）
+**前置要求**：Go 1.26+，Node.js `20.19+` 或 `22.12+`（仅在需要构建 WebUI 时）；同时确保 `npm` 可用，建议 `npm 10+`
 
 ```bash
 # 1. 克隆仓库
@@ -301,7 +320,7 @@ go run ./cmd/ds2api
 
 服务实际绑定：`0.0.0.0:5001`，因此同一局域网设备通常也可以通过你的内网 IP 访问。
 
-> **WebUI 自动构建**：本地首次启动时，若 `static/admin` 不存在，会自动尝试执行 `npm ci`（仅在缺少依赖时）和 `npm run build -- --outDir static/admin --emptyOutDir`（需要本机有 Node.js）。你也可以手动构建：`./scripts/build-webui.sh`
+> **WebUI 自动构建**：本地首次启动时，若 `static/admin` 不存在，会自动尝试执行 `npm ci`（仅在缺少依赖时）和 `npm run build -- --outDir static/admin --emptyOutDir`（需要本机有 Node.js 和 npm）。你也可以手动构建：`./scripts/build-webui.sh`
 
 ## 配置说明
 
@@ -314,8 +333,7 @@ go run ./cmd/ds2api
 - `model_aliases`：OpenAI / Claude / Gemini 共用的模型 alias 映射。
 - `runtime`：账号并发、队列与 token 刷新策略，可通过 Admin Settings 热更新。
 - `auto_delete.mode`：请求结束后的远端会话清理策略，支持 `none` / `single` / `all`。
-- `history_split`：旧轮次拆分字段，已废弃并忽略，仅保留兼容旧配置。
-- `current_input_file`：唯一生效的独立拆分策略；默认开启且阈值为 `0`，触发时将完整上下文合并上传为 `history.txt` 上下文文件。
+- `current_input_file`：全局生效的上下文拆分上传策略；默认开启且阈值为 `0`，触发时将完整上下文合并上传为 `DS2API_HISTORY.txt` 上下文文件。
 - 如果关闭 `current_input_file`，请求会直接透传，不上传拆分上下文文件。
 - `thinking_injection`：默认开启；在最新 user 消息末尾追加思考增强提示词，提高高强度推理与工具调用前的思考稳定性；`prompt` 留空时使用内置默认提示词。
 
@@ -331,6 +349,7 @@ go run ./cmd/ds2api
 | **直通 token 模式** | 传入 token 不在 `config.keys` 中时，直接作为 DeepSeek token 使用 |
 
 可选请求头 `X-Ds2-Target-Account`：指定使用某个托管账号（值为 email 或 mobile）。
+如果指定账号不存在，或者当前管理账号队列已满，请求会返回 `429`；当前 `429` 不附带 `Retry-After` 头。若账号存在但登录/刷新失败，则返回对应的鉴权错误。
 Gemini 路由还可以使用 `x-goog-api-key`，或在没有认证头时使用 `?key=` / `?api_key=` 作为调用方凭据。
 
 ## 并发模型
@@ -343,7 +362,7 @@ Gemini 路由还可以使用 `x-goog-api-key`，或在没有认证头时使用 `
 ```
 
 - 当 in-flight 槽位满时，请求进入等待队列，**不会立即 429**
-- 超出总承载上限后才返回 `429 Too Many Requests`
+- 超出总承载上限后才返回 `429 Too Many Requests`，当前响应不附带 `Retry-After`
 - `GET /admin/queue/status` 返回实时并发状态
 
 ## Tool Call 适配
@@ -421,10 +440,10 @@ npm run build --prefix webui
 
 工作流文件：`.github/workflows/release-artifacts.yml`
 
-- **触发条件**：仅在 GitHub Release `published` 时触发（普通 push 不会触发）
-- **构建产物**：多平台二进制包（`linux/amd64`、`linux/arm64`、`linux/armv7`、`darwin/amd64`、`darwin/arm64`、`windows/amd64`、`windows/arm64`）+ `sha256sums.txt`
+- **触发条件**：默认仅在 GitHub Release `published` 时自动触发；也支持在 Actions 页面手动 `workflow_dispatch`，并填写 `release_tag` 复跑/补发
+- **构建产物**：多平台二进制包（`linux/amd64`、`linux/arm64`、`linux/armv7`、`darwin/amd64`、`darwin/arm64`、`windows/amd64`、`windows/arm64`）、Linux Docker 镜像导出包 + `sha256sums.txt`
 - **容器镜像发布**：仅推送到 GHCR（`ghcr.io/cjackhwang/ds2api`）
-- **每个压缩包包含**：`ds2api` 可执行文件、`static/admin`、WASM 文件（同时支持内置 fallback）、`config.example.json` 配置示例、README、LICENSE
+- **每个二进制压缩包包含**：`ds2api` 可执行文件、`static/admin`、`config.example.json`、`.env.example`、`README.MD`、`README.en.md`、`LICENSE`
 
 ## 免责声明
 

@@ -57,6 +57,78 @@ test('parseToolCalls parses DSML shell as XML-compatible tool call', () => {
   assert.deepEqual(calls[0].input, { path: 'README.MD' });
 });
 
+test('parseToolCalls parses hyphenated DSML shell with here-doc CDATA', () => {
+  const payload = `<dsml-tool-calls>
+<dsml-invoke name="Bash">
+<dsml-parameter name="command"><![CDATA[git commit -m "$(cat <<'EOF'
+docs: add missing directory entries and package descriptions to architecture docs
+Fill gaps identified in architecture audit: add artifacts/ and static/ to
+directory tree, and document 7 auxiliary internal/ packages (textclean,
+claudeconv, compat, rawsample, devcapture, util, version) in Section 3.
+
+Co-Authored-By: Claude Opus 4.7 noreply@anthropic.com
+EOF
+)"]]></dsml-parameter>
+<dsml-parameter name="description"><![CDATA[Create commit with architecture doc updates]]></dsml-parameter>
+</dsml-invoke>
+</dsml-tool-calls>`;
+  const calls = parseToolCalls(payload, ['Bash']);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, 'Bash');
+  assert.equal(calls[0].input.description, 'Create commit with architecture doc updates');
+  assert.equal(calls[0].input.command.includes('git commit -m "$(cat <<\'EOF\''), true);
+  assert.equal(calls[0].input.command.includes('Co-Authored-By: Claude Opus 4.7'), true);
+});
+
+test('parseToolCalls ignores bare hyphenated tool_calls lookalike', () => {
+  const payload = '<tool-calls><invoke name="Bash"><parameter name="command">pwd</parameter></invoke></tool-calls>';
+  const calls = parseToolCalls(payload, ['Bash']);
+  assert.equal(calls.length, 0);
+});
+
+test('parseToolCalls tolerates DSML trailing pipe tag terminator', () => {
+  const payload = [
+    '<|DSML|tool_calls| ',
+    '  <|DSML|invoke name="terminal">',
+    '    <|DSML|parameter name="command"><![CDATA[find "/home" -type d]]></|DSML|parameter>',
+    '    <|DSML|parameter name="timeout"><![CDATA[10]]></|DSML|parameter>',
+    '  </|DSML|invoke>',
+    '</|DSML|tool_calls>',
+  ].join('\n');
+  const calls = parseToolCalls(payload, ['terminal']);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, 'terminal');
+  assert.deepEqual(calls[0].input, { command: 'find "/home" -type d', timeout: 10 });
+});
+
+test('parseToolCalls tolerates extra leading less-than before DSML tags', () => {
+  const payload = [
+    '<<|DSML|tool_calls>',
+    '  <<|DSML|invoke name="Bash">',
+    '    <<|DSML|parameter name="command"><![CDATA[pwd]]></|DSML|parameter>',
+    '  </|DSML|invoke>',
+    '</|DSML|tool_calls>',
+  ].join('\n');
+  const calls = parseToolCalls(payload, ['Bash']);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, 'Bash');
+  assert.deepEqual(calls[0].input, { command: 'pwd' });
+});
+
+test('parseToolCalls tolerates repeated DSML prefix noise', () => {
+  const payload = [
+    '<<DSML|DSML|tool_calls>',
+    '  <<DSML|DSML|invoke name="Bash">',
+    '    <<DSML|DSML|parameter name="command"><![CDATA[git status]]></DSML|DSML|parameter>',
+    '  </DSML|DSML|invoke>',
+    '</DSML|DSML|tool_calls>',
+  ].join('\n');
+  const calls = parseToolCalls(payload, ['Bash']);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, 'Bash');
+  assert.deepEqual(calls[0].input, { command: 'git status' });
+});
+
 test('parseToolCalls tolerates DSML space-separator typo', () => {
   const payload = '<|DSML tool_calls><|DSML invoke name="Read"><|DSML parameter name="file_path"><![CDATA[/tmp/input.txt]]></|DSML parameter></|DSML invoke></|DSML tool_calls>';
   const calls = parseToolCalls(payload, ['Read']);
@@ -188,6 +260,28 @@ test('parseToolCalls treats single-item CDATA body as array', () => {
   assert.deepEqual(calls[0].input.todos, ['one']);
 });
 
+test('parseToolCalls treats loose JSON list as array', () => {
+  for (const [label, body] of [
+    ['plain text', '{"content":"Test TodoWrite tool","status":"completed"}, {"content":"Another task","status":"pending"}'],
+    ['cdata', '<![CDATA[{"content":"Test TodoWrite tool","status":"completed"}, {"content":"Another task","status":"pending"}]]>'],
+  ]) {
+    const payload = `<tool_calls><invoke name="TodoWrite"><parameter name="todos">${body}</parameter></invoke></tool_calls>`;
+    const calls = parseToolCalls(payload, ['TodoWrite']);
+    assert.equal(calls.length, 1, label);
+    assert.deepEqual(calls[0].input.todos, [
+      { content: 'Test TodoWrite tool', status: 'completed' },
+      { content: 'Another task', status: 'pending' },
+    ]);
+  }
+});
+
+test('parseToolCalls keeps preserved text parameters as text', () => {
+  const payload = '<tool_calls><invoke name="Write"><parameter name="content"><![CDATA[{"content":"Test TodoWrite tool","status":"completed"}, {"content":"Another task","status":"pending"}]]></parameter></invoke></tool_calls>';
+  const calls = parseToolCalls(payload, ['Write']);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].input.content, '{"content":"Test TodoWrite tool","status":"completed"}, {"content":"Another task","status":"pending"}');
+});
+
 test('formatOpenAIStreamToolCalls normalizes camelCase inputSchema string fields', () => {
   const formatted = formatOpenAIStreamToolCalls([
     { name: 'Write', input: { content: { message: 'hi' }, taskId: 1 } },
@@ -285,6 +379,39 @@ test('sieve emits tool_calls for DSML space-separator typo', () => {
   assert.equal(text.includes('<|DSML invoke'), false);
 });
 
+test('sieve emits tool_calls for DSML trailing pipe tag terminator', () => {
+  const events = runSieve([
+    '<|DSML|tool_calls| \n',
+    '<|DSML|invoke name="terminal">\n',
+    '<|DSML|parameter name="command"><![CDATA[find "/home" -type d]]></|DSML|parameter>\n',
+    '<|DSML|parameter name="timeout"><![CDATA[10]]></|DSML|parameter>\n',
+    '</|DSML|invoke>\n',
+    '</|DSML|tool_calls>',
+  ], ['terminal']);
+  const finalCalls = events.filter((evt) => evt.type === 'tool_calls').flatMap((evt) => evt.calls || []);
+  const text = collectText(events);
+  assert.equal(finalCalls.length, 1);
+  assert.equal(finalCalls[0].name, 'terminal');
+  assert.deepEqual(finalCalls[0].input, { command: 'find "/home" -type d', timeout: 10 });
+  assert.equal(text.toLowerCase().includes('dsml'), false);
+});
+
+test('sieve emits tool_calls for extra leading less-than DSML tags without leaking prefix', () => {
+  const events = runSieve([
+    '<<|DSML|tool_calls>\n',
+    '<<|DSML|invoke name="Bash">\n',
+    '<<|DSML|parameter name="command"><![CDATA[pwd]]></|DSML|parameter>\n',
+    '</|DSML|invoke>\n',
+    '</|DSML|tool_calls>',
+  ], ['Bash']);
+  const finalCalls = events.filter((evt) => evt.type === 'tool_calls').flatMap((evt) => evt.calls || []);
+  const text = collectText(events);
+  assert.equal(finalCalls.length, 1);
+  assert.equal(finalCalls[0].name, 'Bash');
+  assert.deepEqual(finalCalls[0].input, { command: 'pwd' });
+  assert.equal(text.includes('<'), false);
+});
+
 test('sieve keeps DSML space lookalike tag names as text', () => {
   const input = '<|DSML tool_calls_extra><|DSML invoke name="Read"><|DSML parameter name="file_path">/tmp/input.txt</|DSML parameter></|DSML invoke></|DSML tool_calls_extra>';
   const events = runSieve([input], ['Read']);
@@ -371,6 +498,31 @@ test('sieve preserves Chinese review body with inline DSML mention before real t
   assert.equal(text.includes('它只提到了 `<|DSML|tool_calls>` 和 canonical `<tool_calls>`。由于这涉及 API 兼容性'), true);
   assert.equal(text.includes('补充'), true);
   assert.equal(text.includes('<|DSML|invoke'), false);
+});
+
+test('sieve captures hyphenated DSML shell with here-doc CDATA', () => {
+  const events = runSieve([
+    '<dsml-tool-calls>\n',
+    '<dsml-invoke name="Bash">\n',
+    '<dsml-parameter name="command"><![CDATA[git commit -m "$(cat <<\'EOF\'\n',
+    'docs: add missing directory entries and package descriptions to architecture docs\n',
+    'Fill gaps identified in architecture audit: add artifacts/ and static/ to\n',
+    'directory tree, and document 7 auxiliary internal/ packages (textclean,\n',
+    'claudeconv, compat, rawsample, devcapture, util, version) in Section 3.\n\n',
+    'Co-Authored-By: Claude Opus 4.7 noreply@anthropic.com\n',
+    'EOF\n',
+    ')"]]></dsml-parameter>\n',
+    '<dsml-parameter name="description"><![CDATA[Create commit with architecture doc updates]]></dsml-parameter>\n',
+    '</dsml-invoke>\n',
+    '</dsml-tool-calls>',
+  ], ['Bash']);
+  const text = collectText(events);
+  const finalCalls = events.filter((evt) => evt.type === 'tool_calls').flatMap((evt) => evt.calls || []);
+  assert.equal(finalCalls.length, 1);
+  assert.equal(finalCalls[0].input.command.includes('git commit -m "$(cat <<\'EOF\''), true);
+  assert.equal(finalCalls[0].input.command.includes('Co-Authored-By: Claude Opus 4.7'), true);
+  assert.equal(text.includes('dsml-tool-calls'), false);
+  assert.equal(text.includes('git commit -m'), false);
 });
 
 test('parseToolCalls ignores JSON tool_calls payload (XML-only)', () => {
